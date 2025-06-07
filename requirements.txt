@@ -1,0 +1,8 @@
+flask
+flask-cors
+numpy<2.0.0
+scikit-learn
+tensorflow==2.19.0
+opencv-python-headless
+requests
+Pillow
