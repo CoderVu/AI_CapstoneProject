@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM python:3.10
 
 # Cài đặt các thư viện hệ thống cần thiết
 RUN apt-get update && apt-get install -y \
@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y \
     libsm6 \
     libxrender1 \
     libxext6 \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Tạo thư mục làm việc
@@ -14,7 +15,8 @@ WORKDIR /app
 
 # Sao chép requirements và cài đặt Python packages
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
 # Sao chép toàn bộ mã nguồn vào container
 COPY . .

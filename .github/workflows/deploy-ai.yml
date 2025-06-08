@@ -70,7 +70,7 @@ jobs:
               -v ai-temp:/app/temp \
               -e API_URL=http://20.3.131.196:8080/api/v1/public \
               -e FLASK_ENV=production \
-              -e FLASK_APP=app2.py \
+              -e FLASK_APP=app.py \
               $IMAGE_NAME
 
             # Logout khỏi DockerHub

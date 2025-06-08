@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS  # Import CORS
 import os
-import pickle
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.applications.efficientnet import EfficientNetB3, preprocess_input
@@ -25,12 +24,13 @@ from functools import lru_cache
 import json
 from sklearn.decomposition import PCA
 from tensorflow.keras.preprocessing.image import ImageDataGenerator, load_img, img_to_array
+import time
 
 app = Flask(__name__)
 
 # Enable CORS for all origins
-# CORS(app, supports_credentials=True, origins=["https://polite-plant-004c99b1e.6.azurestaticapps.net"], allow_headers="*")
-CORS(app, supports_credentials=True, origins=["http://localhost:3000"], allow_headers="*")
+CORS(app, supports_credentials=True, origins="*", allow_headers="*")
+# CORS(app, supports_credentials=True, origins=["http://localhost:3000"], allow_headers="*")
 # Load EfficientNetB3 model
 base_model = EfficientNetB3(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
 base_model.trainable = False
@@ -55,6 +55,16 @@ extraction_status = {
 }
 extraction_lock = threading.Lock()
 
+# Thêm biến toàn cục để lưu cache
+_features_cache = {
+    'data': None,
+    'last_update': None,
+    'lock': threading.Lock()
+}
+
+# Thời gian cache hết hạn (30 phút)
+CACHE_EXPIRY = 30 * 60  # seconds
+
 # Định nghĩa mô hình deep learning
 def build_model(input_dim):
     model = models.Sequential()
@@ -67,7 +77,7 @@ def build_model(input_dim):
 
 # Azure Blob Storage URL
 AZURE_URL = "https://dbimage.blob.core.windows.net/images"
-API_URL = "http://localhost:8080/api/v1/public"
+API_URL = os.getenv("API_URL", "http://localhost:8080/api/v1/public")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -481,12 +491,49 @@ def background_extraction(process_all=False):
 def home():
     return jsonify({"message": "Welcome to AI Image Similarity API!"})
 
+def get_cached_features():
+    """
+    Lấy dữ liệu vector features từ cache hoặc API
+    Returns:
+        tuple: (features, filenames, valid_indices) hoặc (None, None, None) nếu có lỗi
+    """
+    global _features_cache
+    
+    current_time = time.time()
+    
+    with _features_cache['lock']:
+        # Kiểm tra cache có hợp lệ không
+        if (_features_cache['data'] is not None and 
+            _features_cache['last_update'] is not None and 
+            current_time - _features_cache['last_update'] < CACHE_EXPIRY):
+            logger.info("Sử dụng dữ liệu từ cache")
+            return _features_cache['data']
+            
+        # Cache hết hạn hoặc chưa có, lấy dữ liệu mới
+        logger.info("Cache hết hạn hoặc chưa có, lấy dữ liệu mới từ API")
+        features, filenames, valid_indices = get_all_image_features()
+        
+        if features is not None:
+            _features_cache['data'] = (features, filenames, valid_indices)
+            _features_cache['last_update'] = current_time
+            logger.info("Đã cập nhật cache với dữ liệu mới")
+            
+        return features, filenames, valid_indices
+
+def invalidate_features_cache():
+    """Xóa cache để force lấy dữ liệu mới"""
+    global _features_cache
+    with _features_cache['lock']:
+        _features_cache['data'] = None
+        _features_cache['last_update'] = None
+        logger.info("Đã xóa cache")
+
 @app.route('/api/find_similar', methods=['POST'])
 def find_similar_images():
     """Find similar images based on a query image URL or uploaded file"""
     try:
-        # Get all image features from API
-        features, filenames, valid_indices = get_all_image_features()
+        # Lấy features từ cache
+        features, filenames, valid_indices = get_cached_features()
         if features is None or filenames is None:
             return jsonify({"error": "No valid images found in database"}), 400
 
@@ -968,6 +1015,10 @@ def update_all_vector_features():
                 })
                 logger.error(f"Error processing image: {str(e)}")
 
+        # Sau khi cập nhật xong, xóa cache
+        invalidate_features_cache()
+        logger.info("Đã cập nhật xong tất cả vector features và xóa cache")
+
         return jsonify({
             "message": "Vector feature update completed",
             "total_images": len(images),
@@ -1081,6 +1132,10 @@ def process_new_images():
                     "error": str(e)
                 })
 
+        # Sau khi xử lý xong, xóa cache
+        invalidate_features_cache()
+        logger.info("Đã xử lý xong ảnh mới và xóa cache")
+
         logger.info("=== KẾT THÚC XỬ LÝ ẢNH MỚI ===")
         logger.info(f"Kết quả: {results['success']} thành công, {results['failed']} thất bại")
 
@@ -1112,7 +1167,8 @@ def update_single_vector_feature():
 
         image_path = data['path']
         image_id = data['id']
-        logger.info(f"Đang xử lý ảnh: {image_path} (ID: {image_id})")
+        force_update = data.get('forceUpdate', False)  # Lấy flag forceUpdate, mặc định là False
+        logger.info(f"Đang xử lý ảnh: {image_path} (ID: {image_id}, forceUpdate: {force_update})")
 
         # Lấy tất cả ảnh từ API và tìm ảnh cần xử lý
         try:
@@ -1154,7 +1210,8 @@ def update_single_vector_feature():
                 len(vector_features.split(',')) >= 100  # Đảm bảo vector có đủ số chiều
             )
 
-            if has_valid_features:
+            # Nếu có vector features hợp lệ và không yêu cầu force update thì bỏ qua
+            if has_valid_features and not force_update:
                 logger.info(f"Ảnh {image_id} đã có vector features hợp lệ, bỏ qua")
                 return jsonify({
                     "message": "Ảnh đã có vector features",
@@ -1164,7 +1221,10 @@ def update_single_vector_feature():
                     "vector_length": len(vector_features.split(','))
                 }), 200
             else:
-                logger.info(f"Ảnh {image_id} chưa có vector features hợp lệ, tiếp tục xử lý")
+                if has_valid_features:
+                    logger.info(f"Ảnh {image_id} đã có vector features nhưng sẽ được cập nhật lại do forceUpdate=True")
+                else:
+                    logger.info(f"Ảnh {image_id} chưa có vector features hợp lệ, tiếp tục xử lý")
                 
         except Exception as e:
             logger.error(f"Lỗi khi kiểm tra thông tin ảnh: {str(e)}")
@@ -1194,7 +1254,9 @@ def update_single_vector_feature():
             )
             
             if update_response.status_code == 200:
-                logger.info(f"Đã cập nhật thành công vector features cho ảnh {image_id}")
+                # Sau khi cập nhật thành công, xóa cache
+                invalidate_features_cache()
+                logger.info(f"Đã cập nhật thành công vector features cho ảnh {image_id} và xóa cache")
                 return jsonify({
                     "message": "Cập nhật vector features thành công",
                     "id": image_id,
@@ -1346,5 +1408,15 @@ def get_products():
         logger.error(f"Error getting products: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/extraction/clear_cache", methods=["POST"])
+def clear_features_cache():
+    """Xóa cache để force lấy dữ liệu mới"""
+    try:
+        invalidate_features_cache()
+        return jsonify({"message": "Cache đã được xóa thành công"}), 200
+    except Exception as e:
+        logger.error(f"Lỗi khi xóa cache: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True)
