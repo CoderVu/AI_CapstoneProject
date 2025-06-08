@@ -48,3 +48,4 @@ EXPOSE 5000
 # Chạy ứng dụng Flask
 CMD ["python", "app.py"]
 # Chay file train 
+#
