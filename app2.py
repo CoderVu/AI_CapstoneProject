@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS  # Import CORS
 import os
-import pickle
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.applications.efficientnet import EfficientNetB3, preprocess_input
@@ -78,7 +77,7 @@ def build_model(input_dim):
 
 # Azure Blob Storage URL
 AZURE_URL = "https://dbimage.blob.core.windows.net/images"
-API_URL = "http://localhost:8080/api/v1/public"
+API_URL = os.getenv("API_URL", "http://localhost:8080/api/v1/public")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
