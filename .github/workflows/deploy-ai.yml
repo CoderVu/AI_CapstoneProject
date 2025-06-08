@@ -14,17 +14,6 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.9'
-
-      - name: Install specific dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install flask flask-cors "numpy<2.0.0" scikit-learn tensorflow==2.19.0 opencv-python-headless requests Pillow
-          echo "Required dependencies installed successfully"
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -46,7 +35,6 @@ jobs:
           docker push $IMAGE_NAME
           
           echo "Successfully built and pushed image: $IMAGE_NAME"
-
       - name: Deploy to Azure VM
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -67,10 +55,8 @@ jobs:
             if [ "$(docker ps -a -q -f name=flask-ai-app)" ]; then
               docker rm flask-ai-app
             fi
-
             # Xóa image cũ nếu có
             docker rmi $IMAGE_NAME || true
-
             # Pull image mới từ DockerHub
             docker pull $IMAGE_NAME
             
@@ -81,12 +67,10 @@ jobs:
               -v ai-temp:/app/temp \
               -e API_URL=http://20.3.131.196:8080/api/v1/public \
               -e FLASK_ENV=production \
-              -e FLASK_APP=app.py \
+              -e FLASK_APP=app2.py \
               $IMAGE_NAME
-
             # Logout khỏi DockerHub
             docker logout
-
             # Log deployment status và cấu hình
             echo "Deployment completed. Container status:"
             docker ps -a | grep flask-ai-app
