@@ -19,13 +19,11 @@ jobs:
         with:
           python-version: '3.9'
 
-      - name: Install dependencies
+      - name: Install specific dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
-          echo "Dependencies installed successfully"
+          pip install flask flask-cors "numpy<2.0.0" scikit-learn tensorflow==2.19.0 opencv-python-headless requests Pillow
+          echo "Required dependencies installed successfully"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
