@@ -63,11 +63,12 @@ jobs:
             # Pull image mới từ DockerHub
             docker pull $IMAGE_NAME
             
-            # Chạy container mới với các biến môi trường có thể cấu hình
+            # Chạy container mới trong network dockervu
             docker run -d --name flask-ai-app \
+              --network dockervu \
               -p 5000:5000 \
               -v ai-temp:/app/temp \
-              -e API_URL=${{ secrets.API_URL }} \
+              -e API_URL=http://springboot_capstone:8080/api/v1/public \
               -e AZURE_URL=${{ secrets.AZURE_URL }} \
               -e FLASK_ENV=production \
               -e FLASK_APP=app2.py \
@@ -80,6 +81,7 @@ jobs:
             echo "Deployment completed. Container status:"
             docker ps -a | grep flask-ai-app
             echo "Current configuration:"
-            echo "API_URL: ${{ secrets.API_URL }}"
+            echo "API_URL: http://springboot_capstone:8080/api/v1/public"
             echo "AZURE_URL: ${{ secrets.AZURE_URL }}"
-            echo "Image: $IMAGE_NAME" 
+            echo "Image: $IMAGE_NAME"
+            echo "Network: dockervu" 
