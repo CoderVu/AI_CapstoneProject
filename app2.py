@@ -24,6 +24,8 @@ import io
 from functools import lru_cache
 import json
 from sklearn.decomposition import PCA
+from tensorflow.keras.preprocessing.image import ImageDataGenerator, load_img, img_to_array
+import time
 
 app = Flask(__name__)
 
@@ -53,6 +55,16 @@ extraction_status = {
     "error": None
 }
 extraction_lock = threading.Lock()
+
+# Thêm biến toàn cục để lưu cache
+_features_cache = {
+    'data': None,
+    'last_update': None,
+    'lock': threading.Lock()
+}
+
+# Thời gian cache hết hạn (30 phút)
+CACHE_EXPIRY = 30 * 60  # seconds
 
 # Định nghĩa mô hình deep learning
 def build_model(input_dim):
@@ -195,6 +207,82 @@ def send_vector_features(image_id, features):
         logger.error(f"Error sending vector features: {str(e)}")
         return False
 
+def augment_and_save_image(img_path, image_id, n_aug=5):
+    """
+    Augment image and save both original and augmented images to database
+    Args:
+        img_path: Path to original image
+        image_id: ID of original image
+        n_aug: Number of augmented images to generate
+    Returns:
+        List of (augmented_image_id, features) tuples
+    """
+    try:
+        # Load and preprocess original image
+        img = load_img(img_path, target_size=(224, 224))
+        img_array = img_to_array(img)
+        img_array = np.expand_dims(img_array, axis=0)
+        
+        # Configure augmentation
+        datagen = ImageDataGenerator(
+            rotation_range=20,
+            width_shift_range=0.2,
+            height_shift_range=0.2,
+            horizontal_flip=True,
+            brightness_range=[0.8, 1.2]
+        )
+        
+        aug_iter = datagen.flow(img_array, batch_size=1)
+        aug_results = []
+        
+        # Process each augmented image
+        for i in range(n_aug):
+            try:
+                # Generate augmented image
+                aug_img = next(aug_iter)[0].astype('uint8')
+                
+                # Convert to bytes for feature extraction
+                aug_img_bytes = aug_img.tobytes()
+                
+                # Extract features
+                features = extract_features(aug_img_bytes)
+                if features is None or not validate_features(features):
+                    logger.warning(f"Invalid features for augmented image {i} of {image_id}")
+                    continue
+                
+                # Create unique ID for augmented image
+                aug_image_id = f"{image_id}_aug_{i}"
+                
+                # Convert features to string
+                features_str = ','.join(map(str, features))
+                
+                # Save to database
+                update_response = requests.put(
+                    f"{API_URL}/image/update/vector_feature",
+                    json={
+                        "id": aug_image_id,
+                        "vectorFeatures": features_str,
+                        "originalImageId": image_id,
+                        "isAugmented": True
+                    }
+                )
+                
+                if update_response.status_code == 200:
+                    logger.info(f"Successfully saved augmented image {i} for {image_id}")
+                    aug_results.append((aug_image_id, features))
+                else:
+                    logger.error(f"Failed to save augmented image {i} for {image_id}")
+                    
+            except Exception as e:
+                logger.error(f"Error processing augmented image {i} for {image_id}: {str(e)}")
+                continue
+                
+        return aug_results
+        
+    except Exception as e:
+        logger.error(f"Error in augment_and_save_image for {image_id}: {str(e)}")
+        return []
+
 def process_single_image(image_url, image_id):
     """Process a single image with enhanced error handling and validation"""
     try:
@@ -204,31 +292,50 @@ def process_single_image(image_url, image_id):
             logger.error(f"Failed to download image: {response.status_code}")
             return False, f"Failed to download image: {response.status_code}"
 
-        # Preprocess image
-        img, error = preprocess_image(response.content)
-        if error:
-            logger.error(f"Error preprocessing image: {error}")
-            return False, error
+        # Save original image temporarily
+        temp_dir = 'temp'
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_path = os.path.join(temp_dir, f"{image_id}_original.jpg")
+        
+        with open(temp_path, 'wb') as f:
+            f.write(response.content)
 
-        # Extract features
-        features = extract_features(img.tobytes())
-        if features is None:
-            logger.error("Feature extraction failed")
-            return False, "Feature extraction failed"
+        try:
+            # Preprocess image
+            img, error = preprocess_image(response.content)
+            if error:
+                logger.error(f"Error preprocessing image: {error}")
+                return False, error
 
-        # Validate features
-        if not validate_features(features):
-            logger.error("Invalid feature vector")
-            return False, "Invalid feature vector"
+            # Extract features for original image
+            features = extract_features(img.tobytes())
+            if features is None:
+                logger.error("Feature extraction failed")
+                return False, "Feature extraction failed"
 
-        # Send to server
-        success = send_vector_features(image_id, features)
-        if not success:
-            logger.error("Failed to save features to server")
-            return False, "Failed to save features to server"
+            # Validate features
+            if not validate_features(features):
+                logger.error("Invalid feature vector")
+                return False, "Invalid feature vector"
 
-        logger.info(f"Successfully processed image {image_url} for image {image_id}")
-        return True, None
+            # Send original image features to server
+            success = send_vector_features(image_id, features)
+            if not success:
+                logger.error("Failed to save features to server")
+                return False, "Failed to save features to server"
+
+            # Generate and save augmented images
+            aug_results = augment_and_save_image(temp_path, image_id)
+            logger.info(f"Generated {len(aug_results)} augmented images for {image_id}")
+
+            logger.info(f"Successfully processed image {image_url} for image {image_id}")
+            return True, None
+            
+        finally:
+            # Clean up temporary file
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+                
     except Exception as e:
         logger.error(f"Error processing image {image_url}: {str(e)}")
         return False, str(e)
@@ -385,12 +492,49 @@ def background_extraction(process_all=False):
 def home():
     return jsonify({"message": "Welcome to AI Image Similarity API!"})
 
+def get_cached_features():
+    """
+    Lấy dữ liệu vector features từ cache hoặc API
+    Returns:
+        tuple: (features, filenames, valid_indices) hoặc (None, None, None) nếu có lỗi
+    """
+    global _features_cache
+    
+    current_time = time.time()
+    
+    with _features_cache['lock']:
+        # Kiểm tra cache có hợp lệ không
+        if (_features_cache['data'] is not None and 
+            _features_cache['last_update'] is not None and 
+            current_time - _features_cache['last_update'] < CACHE_EXPIRY):
+            logger.info("Sử dụng dữ liệu từ cache")
+            return _features_cache['data']
+            
+        # Cache hết hạn hoặc chưa có, lấy dữ liệu mới
+        logger.info("Cache hết hạn hoặc chưa có, lấy dữ liệu mới từ API")
+        features, filenames, valid_indices = get_all_image_features()
+        
+        if features is not None:
+            _features_cache['data'] = (features, filenames, valid_indices)
+            _features_cache['last_update'] = current_time
+            logger.info("Đã cập nhật cache với dữ liệu mới")
+            
+        return features, filenames, valid_indices
+
+def invalidate_features_cache():
+    """Xóa cache để force lấy dữ liệu mới"""
+    global _features_cache
+    with _features_cache['lock']:
+        _features_cache['data'] = None
+        _features_cache['last_update'] = None
+        logger.info("Đã xóa cache")
+
 @app.route('/api/find_similar', methods=['POST'])
 def find_similar_images():
     """Find similar images based on a query image URL or uploaded file"""
     try:
-        # Get all image features from API
-        features, filenames, valid_indices = get_all_image_features()
+        # Lấy features từ cache
+        features, filenames, valid_indices = get_cached_features()
         if features is None or filenames is None:
             return jsonify({"error": "No valid images found in database"}), 400
 
@@ -872,6 +1016,10 @@ def update_all_vector_features():
                 })
                 logger.error(f"Error processing image: {str(e)}")
 
+        # Sau khi cập nhật xong, xóa cache
+        invalidate_features_cache()
+        logger.info("Đã cập nhật xong tất cả vector features và xóa cache")
+
         return jsonify({
             "message": "Vector feature update completed",
             "total_images": len(images),
@@ -985,6 +1133,10 @@ def process_new_images():
                     "error": str(e)
                 })
 
+        # Sau khi xử lý xong, xóa cache
+        invalidate_features_cache()
+        logger.info("Đã xử lý xong ảnh mới và xóa cache")
+
         logger.info("=== KẾT THÚC XỬ LÝ ẢNH MỚI ===")
         logger.info(f"Kết quả: {results['success']} thành công, {results['failed']} thất bại")
 
@@ -1016,7 +1168,8 @@ def update_single_vector_feature():
 
         image_path = data['path']
         image_id = data['id']
-        logger.info(f"Đang xử lý ảnh: {image_path} (ID: {image_id})")
+        force_update = data.get('forceUpdate', False)  # Lấy flag forceUpdate, mặc định là False
+        logger.info(f"Đang xử lý ảnh: {image_path} (ID: {image_id}, forceUpdate: {force_update})")
 
         # Lấy tất cả ảnh từ API và tìm ảnh cần xử lý
         try:
@@ -1058,7 +1211,8 @@ def update_single_vector_feature():
                 len(vector_features.split(',')) >= 100  # Đảm bảo vector có đủ số chiều
             )
 
-            if has_valid_features:
+            # Nếu có vector features hợp lệ và không yêu cầu force update thì bỏ qua
+            if has_valid_features and not force_update:
                 logger.info(f"Ảnh {image_id} đã có vector features hợp lệ, bỏ qua")
                 return jsonify({
                     "message": "Ảnh đã có vector features",
@@ -1068,7 +1222,10 @@ def update_single_vector_feature():
                     "vector_length": len(vector_features.split(','))
                 }), 200
             else:
-                logger.info(f"Ảnh {image_id} chưa có vector features hợp lệ, tiếp tục xử lý")
+                if has_valid_features:
+                    logger.info(f"Ảnh {image_id} đã có vector features nhưng sẽ được cập nhật lại do forceUpdate=True")
+                else:
+                    logger.info(f"Ảnh {image_id} chưa có vector features hợp lệ, tiếp tục xử lý")
                 
         except Exception as e:
             logger.error(f"Lỗi khi kiểm tra thông tin ảnh: {str(e)}")
@@ -1098,7 +1255,9 @@ def update_single_vector_feature():
             )
             
             if update_response.status_code == 200:
-                logger.info(f"Đã cập nhật thành công vector features cho ảnh {image_id}")
+                # Sau khi cập nhật thành công, xóa cache
+                invalidate_features_cache()
+                logger.info(f"Đã cập nhật thành công vector features cho ảnh {image_id} và xóa cache")
                 return jsonify({
                     "message": "Cập nhật vector features thành công",
                     "id": image_id,
@@ -1248,6 +1407,16 @@ def get_products():
 
     except Exception as e:
         logger.error(f"Error getting products: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/extraction/clear_cache", methods=["POST"])
+def clear_features_cache():
+    """Xóa cache để force lấy dữ liệu mới"""
+    try:
+        invalidate_features_cache()
+        return jsonify({"message": "Cache đã được xóa thành công"}), 200
+    except Exception as e:
+        logger.error(f"Lỗi khi xóa cache: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':

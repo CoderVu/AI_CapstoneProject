@@ -1,0 +1,82 @@
+name: Build and Deploy AI App to Azure VM
+
+on:
+  push:
+    branches:
+      - develop
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: DOCKERHUB_USERNAME_AI
+          password: ${{ secrets.DOCKERHUB_USERNAME_AI }}
+
+      - name: Build Docker image
+        run: |
+          docker build -t flask-ai-app .
+
+      - name: Save Docker image to tar file
+        run: |
+          docker save flask-ai-app > flask-ai-app.tar
+
+      - name: Copy Docker image to remote server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: 20.3.131.196
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "flask-ai-app.tar"
+          target: "/home/${{ secrets.SSH_USER }}/"
+
+      - name: SSH and deploy on remote server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: 20.3.131.196
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            # Kiểm tra và dừng container cũ nếu đang chạy
+            if [ "$(docker ps -q -f name=flask-ai-app)" ]; then
+              docker stop flask-ai-app
+            fi
+            if [ "$(docker ps -a -q -f name=flask-ai-app)" ]; then
+              docker rm flask-ai-app
+            fi
+
+            # Xóa image cũ nếu có
+            docker rmi flask-ai-app || true
+
+            # Load lại image từ tar
+            docker load < flask-ai-app.tar
+            
+            # Chạy container mới với các biến môi trường có thể cấu hình
+            docker run -d --name flask-ai-app \
+              -p 5000:5000 \
+              -v ai-temp:/app/temp \
+              -e API_URL=${{ secrets.API_URL }} \
+              -e AZURE_URL=${{ secrets.AZURE_URL }} \
+              -e FLASK_ENV=production \
+              -e FLASK_APP=app2.py \
+              flask-ai-app
+
+            # Cleanup old tar file
+            rm flask-ai-app.tar
+
+            # Log deployment status và cấu hình
+            echo "Deployment completed. Container status:"
+            docker ps -a | grep flask-ai-app
+            echo "Current configuration:"
+            echo "API_URL: ${{ secrets.API_URL }}"
+            echo "AZURE_URL: ${{ secrets.AZURE_URL }}" 
