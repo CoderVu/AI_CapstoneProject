@@ -30,8 +30,8 @@ import time
 app = Flask(__name__)
 
 # Enable CORS for all origins
-# CORS(app, supports_credentials=True, origins=["https://polite-plant-004c99b1e.6.azurestaticapps.net"], allow_headers="*")
-CORS(app, supports_credentials=True, origins=["http://localhost:3000"], allow_headers="*")
+CORS(app, supports_credentials=True, origins="*", allow_headers="*")
+# CORS(app, supports_credentials=True, origins=["http://localhost:3000"], allow_headers="*")
 # Load EfficientNetB3 model
 base_model = EfficientNetB3(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
 base_model.trainable = False
