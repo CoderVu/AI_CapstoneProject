@@ -1,9 +1,10 @@
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS  # Import CORS
 import os
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.applications.resnet50 import ResNet50, preprocess_input
+from tensorflow.keras.applications.efficientnet import EfficientNetB3, preprocess_input
 from tensorflow.keras.preprocessing import image
 from tensorflow.keras.layers import GlobalMaxPooling2D
 from sklearn.metrics.pairwise import cosine_similarity
@@ -31,8 +32,8 @@ app = Flask(__name__)
 # Enable CORS for all origins
 CORS(app, supports_credentials=True, origins="*", allow_headers="*")
 # CORS(app, supports_credentials=True, origins=["http://localhost:3000"], allow_headers="*")
-# Load ResNet50 model
-base_model = ResNet50(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+# Load EfficientNetB3 model
+base_model = EfficientNetB3(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
 base_model.trainable = False
 model = tf.keras.Sequential([base_model, GlobalMaxPooling2D()])
 # Khởi tạo StandardScaler và OneHotEncoder
@@ -54,55 +55,6 @@ extraction_status = {
     "error": None
 }
 extraction_lock = threading.Lock()
-
-# Global variable for configurable vector dimensions
-VECTOR_DIMENSIONS_CONFIG = 2048
-
-# Global variables for models
-_models = {}
-_model_lock = threading.Lock()
-
-def get_model_for_dimensions(dimensions):
-    """Get or create model for specified dimensions using only ResNet50"""
-    global _models
-    
-    with _model_lock:
-        if dimensions not in _models:
-            # Always use ResNet50 as base model
-            base_model = ResNet50(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
-            base_model.trainable = False
-            
-            if dimensions == 2048:
-                # Default ResNet50 with GlobalMaxPooling2D (2048 dimensions)
-                model = tf.keras.Sequential([base_model, GlobalMaxPooling2D()])
-            elif dimensions == 4096:
-                # ResNet50 with additional Dense layer to expand to 4096
-                model = tf.keras.Sequential([
-                    base_model, 
-                    GlobalMaxPooling2D(),
-                    tf.keras.layers.Dense(4096, activation='relu')
-                ])
-            elif dimensions in [512, 1024, 1536]:
-                # ResNet50 with Dense layer to reduce dimensions
-                model = tf.keras.Sequential([
-                    base_model, 
-                    GlobalMaxPooling2D(),
-                    tf.keras.layers.Dense(dimensions, activation='relu')
-                ])
-            else:
-                # Default to ResNet50 with GlobalMaxPooling2D
-                model = tf.keras.Sequential([base_model, GlobalMaxPooling2D()])
-            
-            _models[dimensions] = model
-            logger.info(f"Created ResNet50 model for {dimensions} dimensions")
-        
-        return _models[dimensions]
-
-# Initialize default model
-base_model = ResNet50(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
-base_model.trainable = False
-model = tf.keras.Sequential([base_model, GlobalMaxPooling2D()])
-_models[2048] = model  # Store default model
 
 # Thêm biến toàn cục để lưu cache
 _features_cache = {
@@ -209,30 +161,17 @@ def extract_features(img_array_bytes):
         img_tensor = tf.convert_to_tensor(img, dtype=tf.float32)
         img_tensor = preprocess_input(img_tensor)
         
-        # Get the appropriate model for current dimensions
-        current_model = get_model_for_dimensions(VECTOR_DIMENSIONS_CONFIG)
-        
         # Extract features using the model
-        features = current_model(img_tensor)
+        features = model(img_tensor)
         
         # Convert to numpy and normalize
         features = features.numpy()
         features = features / np.linalg.norm(features)
         
-        # Check if dimensions match expected
-        if features.size != VECTOR_DIMENSIONS_CONFIG:
-            logger.error(f"Model output dimensions {features.size} don't match expected {VECTOR_DIMENSIONS_CONFIG}")
-            return None
-        
         return features.flatten()  # Return 1D array
     except Exception as e:
         logger.error(f"Error extracting features: {str(e)}")
         return None
-
-def get_vector_dimensions():
-    """Get the expected vector dimensions for the current model"""
-    # ResNet50 with GlobalMaxPooling2D produces 2048-dimensional features
-    return VECTOR_DIMENSIONS_CONFIG
 
 def send_vector_features(image_id, features):
     """
@@ -247,21 +186,17 @@ def send_vector_features(image_id, features):
         # Convert features to string format
         features_str = ','.join(map(str, features))
         
-        # Get vector dimensions
-        vector_dimensions = len(features)
-        
         # Send update request to API
         update_response = requests.put(
             f"{API_URL}/image/update/vector_feature",
             json={
                 "id": image_id,
-                "vectorFeatures": features_str,
-                "vectorDimensions": vector_dimensions
+                "vectorFeatures": features_str
             }
         )
         
         if update_response.status_code == 200:
-            logger.info(f"Successfully updated vector features for image {image_id} with {vector_dimensions} dimensions")
+            logger.info(f"Successfully updated vector features for image {image_id}")
             return True
         else:
             logger.error(f"Failed to update vector features: {update_response.status_code}")
@@ -422,10 +357,9 @@ def validate_features(features):
         if len(features.shape) > 1:
             features = features.flatten()
             
-        # Check if vector has expected dimensions from config
-        expected_dimensions = get_vector_dimensions()
-        if features.size != expected_dimensions:
-            logger.error(f"Invalid feature dimensions: {features.size} != {expected_dimensions}")
+        # Check if vector has expected dimensions (1536 for EfficientNetB3 with GlobalMaxPooling2D)
+        if features.size != 1536:
+            logger.error(f"Invalid feature dimensions: {features.size} != 1536")
             return False
             
         # Check for NaN or infinite values
@@ -452,35 +386,23 @@ def reduce_dimensions(features, target_dim=512):
     """
     Reduce feature dimensions using PCA if needed
     Args:
-        features: numpy array of features (n_samples, n_features) or (n_features,)
+        features: numpy array of features (n_samples, n_features)
         target_dim: target dimension (default: 512)
     Returns:
         Reduced features
     """
     try:
-        # Ensure features is 2D
-        if len(features.shape) == 1:
-            features = features.reshape(1, -1)
-        
-        original_dim = features.shape[1]
-        
-        if original_dim == target_dim:
+        if features.shape[1] == target_dim:
             return features
             
-        logger.info(f"Applying PCA to reduce dimensions from {original_dim} to {target_dim}")
-        
         pca = PCA(n_components=target_dim)
         reduced_features = pca.fit_transform(features)
-        
-        # Calculate explained variance ratio
-        explained_variance_ratio = np.sum(pca.explained_variance_ratio_)
-        logger.info(f"PCA explained variance ratio: {explained_variance_ratio:.4f} ({explained_variance_ratio*100:.2f}%)")
         
         # Normalize the reduced features
         norms = np.linalg.norm(reduced_features, axis=1)
         reduced_features = reduced_features / norms[:, np.newaxis]
         
-        logger.info(f"Successfully reduced features from {original_dim} to {target_dim} dimensions")
+        logger.info(f"Reduced features from {features.shape[1]} to {target_dim} dimensions")
         return reduced_features
     except Exception as e:
         logger.error(f"Error reducing dimensions: {str(e)}")
@@ -1274,7 +1196,6 @@ def update_single_vector_feature():
                 return jsonify({"error": "Không tìm thấy ảnh trong hệ thống"}), 404
 
             vector_features = image_data.get('vectorFeatures')
-            expected_dimensions = get_vector_dimensions()
             
             # Log chi tiết về vector features
             logger.info(f"Vector features của ảnh {image_id}:")
@@ -1282,21 +1203,14 @@ def update_single_vector_feature():
             logger.info(f"- Độ dài vector: {len(vector_features) if vector_features else 0}")
             logger.info(f"- Vector features: {vector_features[:100] + '...' if vector_features and len(vector_features) > 100 else vector_features}")
 
-            # Kiểm tra kỹ hơn về vector features và chiều vector
+            # Kiểm tra kỹ hơn về vector features
             has_valid_features = (
                 vector_features and 
                 isinstance(vector_features, str) and 
                 vector_features.strip() and 
-                len(vector_features.split(',')) == expected_dimensions  # Đảm bảo vector có đúng số chiều
+                len(vector_features.split(',')) >= 100  # Đảm bảo vector có đủ số chiều
             )
 
-            # Kiểm tra tính nhất quán với các ảnh khác trong hệ thống
-            existing_dimensions = set()
-            for img in images:
-                if img.get('vectorFeatures') and img.get('id') != image_id:
-                    dim = len(img.get('vectorFeatures').split(','))
-                    existing_dimensions.add(dim)
-            
             # Nếu có vector features hợp lệ và không yêu cầu force update thì bỏ qua
             if has_valid_features and not force_update:
                 logger.info(f"Ảnh {image_id} đã có vector features hợp lệ, bỏ qua")
@@ -1305,9 +1219,7 @@ def update_single_vector_feature():
                     "id": image_id,
                     "path": image_path,
                     "status": "skipped",
-                    "vector_length": len(vector_features.split(',')),
-                    "expected_dimensions": expected_dimensions,
-                    "is_consistent": True
+                    "vector_length": len(vector_features.split(','))
                 }), 200
             else:
                 if has_valid_features:
@@ -1327,16 +1239,6 @@ def update_single_vector_feature():
             logger.error(f"Không thể trích xuất đặc trưng cho ảnh {image_id}")
             return jsonify({"error": "Không thể trích xuất đặc trưng"}), 400
 
-        # Kiểm tra chiều vector sau khi trích xuất
-        actual_dimensions = len(features)
-        if actual_dimensions != expected_dimensions:
-            logger.error(f"Chiều vector không đúng: {actual_dimensions} != {expected_dimensions}")
-            return jsonify({
-                "error": f"Chiều vector không đúng: {actual_dimensions} != {expected_dimensions}",
-                "actual_dimensions": actual_dimensions,
-                "expected_dimensions": expected_dimensions
-            }), 400
-
         # Chuyển đổi features thành string
         features_str = ','.join(map(str, features))
         logger.info(f"Đã trích xuất và chuẩn hóa đặc trưng thành công, độ dài vector: {len(features)}")
@@ -1348,8 +1250,7 @@ def update_single_vector_feature():
                 f"{API_URL}/image/update/vector_feature",
                 json={
                     "id": image_id,
-                    "vectorFeatures": features_str,
-                    "vectorDimensions": actual_dimensions
+                    "vectorFeatures": features_str
                 }
             )
             
@@ -1362,9 +1263,7 @@ def update_single_vector_feature():
                     "id": image_id,
                     "path": image_path,
                     "status": "success",
-                    "vector_length": len(features),
-                    "expected_dimensions": expected_dimensions,
-                    "is_consistent": True
+                    "vector_length": len(features)
                 }), 200
             else:
                 logger.error(f"Lỗi khi cập nhật vector features: {update_response.status_code}")
@@ -1518,330 +1417,6 @@ def clear_features_cache():
         return jsonify({"message": "Cache đã được xóa thành công"}), 200
     except Exception as e:
         logger.error(f"Lỗi khi xóa cache: {str(e)}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/api/extraction/vector_dimensions", methods=["GET"])
-def get_vector_dimensions_info():
-    """Get information about vector dimensions across all images"""
-    try:
-        # Get all images from API
-        response = requests.get(f"{API_URL}/images")
-        if response.status_code != 200:
-            return jsonify({"error": "Failed to fetch images from API"}), 500
-
-        data = response.json()
-        if isinstance(data, dict) and 'data' in data:
-            images = data['data']
-        else:
-            images = data if isinstance(data, list) else []
-
-        if not images:
-            return jsonify({"error": "No images found in database"}), 400
-
-        # Analyze vector dimensions
-        dimension_stats = {}
-        images_with_features = []
-        images_without_features = []
-        inconsistent_dimensions = []
-
-        expected_dimensions = get_vector_dimensions()
-
-        for img in images:
-            vector_features = img.get('vectorFeatures')
-            vector_dimensions = img.get('vectorDimensions')
-            
-            if vector_features and vector_features.strip():
-                # Count dimensions
-                actual_dimensions = len(vector_features.split(','))
-                
-                if actual_dimensions not in dimension_stats:
-                    dimension_stats[actual_dimensions] = 0
-                dimension_stats[actual_dimensions] += 1
-                
-                images_with_features.append({
-                    'id': img.get('id'),
-                    'path': img.get('path'),
-                    'productId': img.get('productId'),
-                    'actual_dimensions': actual_dimensions,
-                    'expected_dimensions': expected_dimensions,
-                    'is_consistent': actual_dimensions == expected_dimensions
-                })
-                
-                # Check for inconsistency
-                if actual_dimensions != expected_dimensions:
-                    inconsistent_dimensions.append({
-                        'id': img.get('id'),
-                        'path': img.get('path'),
-                        'productId': img.get('productId'),
-                        'actual_dimensions': actual_dimensions,
-                        'expected_dimensions': expected_dimensions
-                    })
-            else:
-                images_without_features.append({
-                    'id': img.get('id'),
-                    'path': img.get('path'),
-                    'productId': img.get('productId')
-                })
-
-        # Group by product
-        product_dimensions = {}
-        for img in images_with_features:
-            product_id = img['productId']
-            if product_id not in product_dimensions:
-                product_dimensions[product_id] = {
-                    'productId': product_id,
-                    'total_images': 0,
-                    'images_with_features': 0,
-                    'dimensions': set(),
-                    'is_consistent': True
-                }
-            
-            product_dimensions[product_id]['total_images'] += 1
-            product_dimensions[product_id]['images_with_features'] += 1
-            product_dimensions[product_id]['dimensions'].add(img['actual_dimensions'])
-            
-            if not img['is_consistent']:
-                product_dimensions[product_id]['is_consistent'] = False
-
-        # Convert sets to lists for JSON serialization
-        for product in product_dimensions.values():
-            product['dimensions'] = list(product['dimensions'])
-
-        return jsonify({
-            "expected_dimensions": expected_dimensions,
-            "dimension_stats": dimension_stats,
-            "total_images": len(images),
-            "images_with_features": len(images_with_features),
-            "images_without_features": len(images_without_features),
-            "inconsistent_dimensions": inconsistent_dimensions,
-            "product_dimensions": list(product_dimensions.values()),
-            "is_system_consistent": len(inconsistent_dimensions) == 0 and len(images_with_features) > 0
-        }), 200
-
-    except Exception as e:
-        logger.error(f"Error getting vector dimensions info: {str(e)}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/api/extraction/config", methods=["GET", "POST"])
-def configure_extraction():
-    """Configure extraction settings and get current configuration"""
-    global VECTOR_DIMENSIONS_CONFIG
-    
-    if request.method == "GET":
-        # Get current configuration
-        current_dimensions = VECTOR_DIMENSIONS_CONFIG
-        
-        # Always use ResNet50 for all dimensions
-        model_type = "ResNet50"
-        
-        return jsonify({
-            "vector_dimensions": current_dimensions,
-            "model_type": model_type,
-            "available_dimensions": [512, 1024, 1536, 2048, 4096],
-            "description": "Sử dụng ResNet50 với Dense layer để giảm hoặc mở rộng chiều vector"
-        }), 200
-    
-    elif request.method == "POST":
-        try:
-            data = request.get_json()
-            if not data:
-                return jsonify({"error": "No configuration data provided"}), 400
-            
-            new_dimensions = data.get("vector_dimensions")
-            if not new_dimensions:
-                return jsonify({"error": "vector_dimensions is required"}), 400
-            
-            # Validate dimensions
-            available_dimensions = [512, 1024, 1536, 2048, 4096]
-            if new_dimensions not in available_dimensions:
-                return jsonify({
-                    "error": f"Invalid vector dimensions. Must be one of: {available_dimensions}"
-                }), 400
-            
-            # Check if dimensions changed
-            dimensions_changed = VECTOR_DIMENSIONS_CONFIG != new_dimensions
-            
-            # Update configuration
-            old_dimensions = VECTOR_DIMENSIONS_CONFIG
-            VECTOR_DIMENSIONS_CONFIG = new_dimensions
-            
-            logger.info(f"Vector dimensions changed from {old_dimensions} to {new_dimensions}")
-            
-            # Clear cache when dimensions change
-            if dimensions_changed:
-                invalidate_features_cache()
-                # Clear model cache to force recreation of model for new dimensions
-                global _models
-                with _model_lock:
-                    _models.clear()
-                logger.info("Cache and model cache cleared due to dimension change")
-            
-            # Check if there are any existing features
-            response = requests.get(f"{API_URL}/images")
-            if response.status_code == 200:
-                data = response.json()
-                if isinstance(data, dict) and 'data' in data:
-                    images = data['data']
-                else:
-                    images = data if isinstance(data, list) else []
-                
-                existing_features_count = sum(1 for img in images if img.get('vectorFeatures') and img.get('vectorFeatures').strip())
-                
-                return jsonify({
-                    "message": "Configuration updated successfully",
-                    "old_dimensions": old_dimensions,
-                    "new_dimensions": new_dimensions,
-                    "dimensions_changed": dimensions_changed,
-                    "existing_features_count": existing_features_count,
-                    "needs_re_extraction": dimensions_changed and existing_features_count > 0,
-                    "available_dimensions": available_dimensions
-                }), 200
-            else:
-                return jsonify({
-                    "message": "Configuration updated successfully",
-                    "old_dimensions": old_dimensions,
-                    "new_dimensions": new_dimensions,
-                    "dimensions_changed": dimensions_changed,
-                    "warning": "Could not check existing features"
-                }), 200
-                
-        except Exception as e:
-            logger.error(f"Error configuring extraction: {str(e)}")
-            return jsonify({"error": str(e)}), 500
-
-@app.route("/api/extraction/fix_dimensions", methods=["POST"])
-def fix_inconsistent_dimensions():
-    """Fix images with inconsistent vector dimensions"""
-    try:
-        logger.info("=== BẮT ĐẦU SỬA CHỮA CHIỀU VECTOR KHÔNG NHẤT QUÁN ===")
-        
-        # Get vector dimensions info
-        response = requests.get(f"{API_URL}/images")
-        if response.status_code != 200:
-            return jsonify({"error": "Failed to fetch images from API"}), 500
-
-        data = response.json()
-        if isinstance(data, dict) and 'data' in data:
-            images = data['data']
-        else:
-            images = data if isinstance(data, list) else []
-
-        if not images:
-            return jsonify({"error": "No images found in database"}), 400
-
-        expected_dimensions = get_vector_dimensions()
-        inconsistent_images = []
-        
-        # Find images with inconsistent dimensions
-        for img in images:
-            vector_features = img.get('vectorFeatures')
-            if vector_features and vector_features.strip():
-                actual_dimensions = len(vector_features.split(','))
-                if actual_dimensions != expected_dimensions:
-                    inconsistent_images.append(img)
-
-        if not inconsistent_images:
-            return jsonify({
-                "message": "Không có ảnh nào có chiều vector không nhất quán",
-                "fixed_count": 0,
-                "total_checked": len(images)
-            }), 200
-
-        logger.info(f"Tìm thấy {len(inconsistent_images)} ảnh có chiều vector không nhất quán")
-
-        # Fix each inconsistent image
-        success_count = 0
-        failed_count = 0
-        failed_images = []
-
-        for img in inconsistent_images:
-            try:
-                image_id = img.get('id')
-                image_path = img.get('path')
-                
-                if not image_id or not image_path:
-                    logger.warning(f"Ảnh thiếu thông tin: ID={image_id}, Path={image_path}")
-                    failed_count += 1
-                    failed_images.append({
-                        "id": image_id,
-                        "error": "Thiếu thông tin ảnh"
-                    })
-                    continue
-
-                logger.info(f"Đang sửa chữa ảnh: {image_path} (ID: {image_id})")
-
-                # Extract features
-                features = extract_features_from_url(image_path)
-                if features is None:
-                    logger.error(f"Không thể trích xuất đặc trưng cho ảnh {image_id}")
-                    failed_count += 1
-                    failed_images.append({
-                        "id": image_id,
-                        "error": "Không thể trích xuất đặc trưng"
-                    })
-                    continue
-
-                # Check dimensions again
-                actual_dimensions = len(features)
-                if actual_dimensions != expected_dimensions:
-                    logger.error(f"Chiều vector vẫn không đúng sau khi trích xuất: {actual_dimensions} != {expected_dimensions}")
-                    failed_count += 1
-                    failed_images.append({
-                        "id": image_id,
-                        "error": f"Chiều vector không đúng: {actual_dimensions} != {expected_dimensions}"
-                    })
-                    continue
-
-                # Convert features to string
-                features_str = ','.join(map(str, features))
-
-                # Update vector features
-                update_response = requests.put(
-                    f"{API_URL}/image/update/vector_feature",
-                    json={
-                        "id": image_id,
-                        "vectorFeatures": features_str,
-                        "vectorDimensions": actual_dimensions
-                    }
-                )
-
-                if update_response.status_code == 200:
-                    logger.info(f"Đã sửa chữa thành công vector features cho ảnh {image_id}")
-                    success_count += 1
-                else:
-                    logger.error(f"Không thể cập nhật vector features: {update_response.status_code}")
-                    failed_count += 1
-                    failed_images.append({
-                        "id": image_id,
-                        "error": f"Lỗi cập nhật: {update_response.status_code}"
-                    })
-
-            except Exception as e:
-                logger.error(f"Lỗi khi sửa chữa ảnh {image_id}: {str(e)}")
-                failed_count += 1
-                failed_images.append({
-                    "id": image_id,
-                    "error": str(e)
-                })
-
-        # Invalidate cache
-        invalidate_features_cache()
-        logger.info("Đã sửa chữa xong và xóa cache")
-
-        logger.info("=== KẾT THÚC SỬA CHỮA CHIỀU VECTOR KHÔNG NHẤT QUÁN ===")
-        logger.info(f"Kết quả: {success_count} thành công, {failed_count} thất bại")
-
-        return jsonify({
-            "message": "Đã sửa chữa xong chiều vector không nhất quán",
-            "total_checked": len(images),
-            "inconsistent_found": len(inconsistent_images),
-            "fixed_count": success_count,
-            "failed_count": failed_count,
-            "failed_images": failed_images
-        }), 200
-
-    except Exception as e:
-        logger.error(f"Lỗi không mong muốn: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
