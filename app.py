@@ -68,6 +68,7 @@ def get_model_for_dimensions(dimensions):
     
     with _model_lock:
         if dimensions not in _models:
+            logger.info(f"Creating new model for {dimensions} dimensions")
             # Always use ResNet50 as base model
             base_model = ResNet50(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
             base_model.trainable = False
@@ -75,6 +76,7 @@ def get_model_for_dimensions(dimensions):
             if dimensions == 2048:
                 # Default ResNet50 with GlobalMaxPooling2D (2048 dimensions)
                 model = tf.keras.Sequential([base_model, GlobalMaxPooling2D()])
+                logger.info("Created ResNet50 with GlobalMaxPooling2D for 2048 dimensions")
             elif dimensions == 4096:
                 # ResNet50 with additional Dense layer to expand to 4096
                 model = tf.keras.Sequential([
@@ -82,6 +84,7 @@ def get_model_for_dimensions(dimensions):
                     GlobalMaxPooling2D(),
                     tf.keras.layers.Dense(4096, activation='relu')
                 ])
+                logger.info("Created ResNet50 with Dense(4096) for 4096 dimensions")
             elif dimensions in [512, 1024, 1536]:
                 # ResNet50 with Dense layer to reduce dimensions
                 model = tf.keras.Sequential([
@@ -89,12 +92,21 @@ def get_model_for_dimensions(dimensions):
                     GlobalMaxPooling2D(),
                     tf.keras.layers.Dense(dimensions, activation='relu')
                 ])
+                logger.info(f"Created ResNet50 with Dense({dimensions}) for {dimensions} dimensions")
             else:
                 # Default to ResNet50 with GlobalMaxPooling2D
                 model = tf.keras.Sequential([base_model, GlobalMaxPooling2D()])
+                logger.info(f"Created default ResNet50 with GlobalMaxPooling2D for {dimensions} dimensions")
+            
+            # Test the model output shape
+            test_input = tf.random.normal((1, 224, 224, 3))
+            test_output = model(test_input)
+            logger.info(f"Model test output shape: {test_output.shape}")
             
             _models[dimensions] = model
             logger.info(f"Created ResNet50 model for {dimensions} dimensions")
+        else:
+            logger.info(f"Using cached model for {dimensions} dimensions")
         
         return _models[dimensions]
 
@@ -211,20 +223,30 @@ def extract_features(img_array_bytes):
         
         # Get the appropriate model for current dimensions
         current_model = get_model_for_dimensions(VECTOR_DIMENSIONS_CONFIG)
+        logger.info(f"Using model for {VECTOR_DIMENSIONS_CONFIG} dimensions")
         
         # Extract features using the model
         features = current_model(img_tensor)
+        logger.info(f"Raw features shape: {features.shape}")
         
         # Convert to numpy and normalize
         features = features.numpy()
         features = features / np.linalg.norm(features)
+        logger.info(f"Normalized features shape: {features.shape}")
         
-        # Check if dimensions match expected
-        if features.size != VECTOR_DIMENSIONS_CONFIG:
-            logger.error(f"Model output dimensions {features.size} don't match expected {VECTOR_DIMENSIONS_CONFIG}")
+        # Check if dimensions match expected - FIXED LOGIC
+        expected_dimensions = VECTOR_DIMENSIONS_CONFIG
+        actual_dimensions = features.shape[-1] if len(features.shape) > 1 else features.size
+        
+        logger.info(f"Expected dimensions: {expected_dimensions}, Actual dimensions: {actual_dimensions}")
+        
+        if actual_dimensions != expected_dimensions:
+            logger.error(f"Model output dimensions {actual_dimensions} don't match expected {expected_dimensions}")
             return None
         
-        return features.flatten()  # Return 1D array
+        flattened_features = features.flatten()  # Return 1D array
+        logger.info(f"Final flattened features shape: {flattened_features.shape}")
+        return flattened_features
     except Exception as e:
         logger.error(f"Error extracting features: {str(e)}")
         return None
@@ -755,7 +777,7 @@ def get_extraction_stats():
             "images_without_features": total_images - images_with_features,
             "completion_percentage": (images_with_features / total_images * 100) if total_images > 0 else 0,
             "product_stats": product_stats
-        })
+        }), 200
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1290,13 +1312,6 @@ def update_single_vector_feature():
                 len(vector_features.split(',')) == expected_dimensions  # Đảm bảo vector có đúng số chiều
             )
 
-            # Kiểm tra tính nhất quán với các ảnh khác trong hệ thống
-            existing_dimensions = set()
-            for img in images:
-                if img.get('vectorFeatures') and img.get('id') != image_id:
-                    dim = len(img.get('vectorFeatures').split(','))
-                    existing_dimensions.add(dim)
-            
             # Nếu có vector features hợp lệ và không yêu cầu force update thì bỏ qua
             if has_valid_features and not force_update:
                 logger.info(f"Ảnh {image_id} đã có vector features hợp lệ, bỏ qua")
@@ -1327,9 +1342,9 @@ def update_single_vector_feature():
             logger.error(f"Không thể trích xuất đặc trưng cho ảnh {image_id}")
             return jsonify({"error": "Không thể trích xuất đặc trưng"}), 400
 
-        # Kiểm tra chiều vector sau khi trích xuất
+        # Kiểm tra chiều vector sau khi trích xuất - CHỈ KIỂM TRA KHI KHÔNG PHẢI FORCE UPDATE
         actual_dimensions = len(features)
-        if actual_dimensions != expected_dimensions:
+        if not force_update and actual_dimensions != expected_dimensions:
             logger.error(f"Chiều vector không đúng: {actual_dimensions} != {expected_dimensions}")
             return jsonify({
                 "error": f"Chiều vector không đúng: {actual_dimensions} != {expected_dimensions}",
