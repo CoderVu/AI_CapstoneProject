@@ -317,93 +317,22 @@ def send_vector_features(image_id, features):
         # Get vector dimensions
         vector_dimensions = len(features)
         
-        # Log the request details for debugging
-        logger.info(f"Sending vector features for image {image_id}")
-        logger.info(f"Vector dimensions: {vector_dimensions}")
-        logger.info(f"First 5 values: {features_list[:5]}")
-        logger.info(f"Last 5 values: {features_list[-5:]}")
+        # Send update request to API with List<Double> format and longer timeout
+        update_response = session.put(
+            f"{API_URL}/image/update/vector_feature",
+            json={
+                "id": image_id,
+                "vector": features_list  # Send as List<Double> instead of string
+            },
+            timeout=API_TIMEOUT
+        )
         
-        # Create the request payload exactly as expected by Java VectorFeatureRequest
-        request_payload = {
-            "id": image_id,
-            "vector": features_list
-        }
-        
-        logger.info(f"Request payload: {request_payload}")
-        
-        # First check if the image exists in the database and has vectorFeatures
-        images_response = session.get(f"{API_URL}/images", timeout=API_TIMEOUT)
-        if images_response.status_code == 200:
-            data = images_response.json()
-            if isinstance(data, dict) and 'data' in data:
-                images = data['data']
-            else:
-                images = data if isinstance(data, list) else []
-            
-            # Find the specific image
-            image_data = next((img for img in images if img.get('id') == image_id), None)
-            if image_data:
-                logger.info(f"Image {image_id} found in database")
-                current_vector_features = image_data.get('vectorFeatures')
-                logger.info(f"Current vectorFeatures: {current_vector_features}")
-                
-                # Check if image already has vector features
-                has_vector_features = (
-                    current_vector_features and 
-                    isinstance(current_vector_features, list) and 
-                    len(current_vector_features) > 0
-                )
-                
-                if has_vector_features:
-                    logger.info(f"Image {image_id} already has vector features, trying update endpoint")
-                    # Try update endpoint first
-                    response = session.put(
-                        f"{API_URL}/image/update/vector_feature",
-                        json=request_payload,
-                        timeout=API_TIMEOUT
-                    )
-                    
-                    # If update fails, try add endpoint
-                    if response.status_code != 200:
-                        logger.warning(f"Update failed ({response.status_code}): {response.text}, trying add endpoint")
-                        response = session.post(
-                            f"{API_URL}/image/add/vector_feature",
-                            json=request_payload,
-                            timeout=API_TIMEOUT
-                        )
-                else:
-                    logger.info(f"Image {image_id} has no vector features, using add endpoint")
-                    # Use add endpoint
-                    response = session.post(
-                        f"{API_URL}/image/add/vector_feature",
-                        json=request_payload,
-                        timeout=API_TIMEOUT
-                    )
-            else:
-                logger.warning(f"Image {image_id} not found in database, using add endpoint")
-                # Use add endpoint for new images
-                response = session.post(
-                    f"{API_URL}/image/add/vector_feature",
-                    json=request_payload,
-                    timeout=API_TIMEOUT
-                )
-        else:
-            logger.warning(f"Could not fetch images from database: {images_response.status_code}, using add endpoint")
-            # Use add endpoint as fallback
-            response = session.post(
-                f"{API_URL}/image/add/vector_feature",
-                json=request_payload,
-                timeout=API_TIMEOUT
-            )
-        
-        if response.status_code == 200:
-            logger.info(f"Successfully processed vector features for image {image_id} with {vector_dimensions} dimensions")
+        if update_response.status_code == 200:
+            logger.info(f"Successfully updated vector features for image {image_id} with {vector_dimensions} dimensions")
             return True
         else:
-            logger.error(f"Failed to process vector features: {response.status_code}")
-            logger.error(f"Response: {response.text}")
-            logger.error(f"Request payload: {request_payload}")
-            logger.error(f"Vector length: {len(features_list)}")
+            logger.error(f"Failed to update vector features: {update_response.status_code}")
+            logger.error(f"Response: {update_response.text}")
             return False
             
     except requests.exceptions.Timeout:
@@ -462,28 +391,25 @@ def augment_and_save_image(img_path, image_id, n_aug=5):
                 # Create unique ID for augmented image
                 aug_image_id = f"{image_id}_aug_{i}"
                 
-                # Convert features to List<Double> format for Java API
-                features_list = features.tolist()
-                
-                # Create request payload
-                request_payload = {
-                    "id": aug_image_id,
-                    "vector": features_list
-                }
+                # Convert features to string
+                features_str = ','.join(map(str, features))
                 
                 # Save to database
-                update_response = session.put(
+                update_response = requests.put(
                     f"{API_URL}/image/update/vector_feature",
-                    json=request_payload,
-                    timeout=API_TIMEOUT
+                    json={
+                        "id": aug_image_id,
+                        "vectorFeatures": features_str,
+                        "originalImageId": image_id,
+                        "isAugmented": True
+                    }
                 )
                 
                 if update_response.status_code == 200:
                     logger.info(f"Successfully saved augmented image {i} for {image_id}")
                     aug_results.append((aug_image_id, features))
                 else:
-                    logger.error(f"Failed to save augmented image {i} for {image_id}: {update_response.status_code}")
-                    logger.error(f"Response: {update_response.text}")
+                    logger.error(f"Failed to save augmented image {i} for {image_id}")
                     
             except Exception as e:
                 logger.error(f"Error processing augmented image {i} for {image_id}: {str(e)}")
@@ -1278,7 +1204,7 @@ def update_all_vector_features():
                     f"{API_URL}/image/update/vector_feature",
                     json={
                         "id": image_id,
-                        "vector": features_list  # Send as List<Double> for Java VectorFeatureRequest
+                        "vector": features_list  # Send as List<Double> instead of string
                     },
                     timeout=API_TIMEOUT
                 )
@@ -1287,29 +1213,12 @@ def update_all_vector_features():
                     success_count += 1
                     logger.info(f"Successfully updated features for image {image_id}")
                 else:
+                    failed_count += 1
+                    failed_images.append({
+                        "id": image_id,
+                        "error": f"API update failed: {update_response.status_code}"
+                    })
                     logger.error(f"Failed to update features for image {image_id}: {update_response.status_code}")
-                    logger.error(f"Update response: {update_response.text}")
-                    logger.error(f"Request payload: {request_payload}")
-                    
-                    # Try add endpoint if update fails
-                    logger.info("Trying add endpoint as fallback...")
-                    add_response = session.post(
-                        f"{API_URL}/image/add/vector_feature",
-                        json=request_payload,
-                        timeout=API_TIMEOUT
-                    )
-                    
-                    if add_response.status_code == 200:
-                        success_count += 1
-                        logger.info(f"Add endpoint succeeded for image {image_id}")
-                    else:
-                        logger.error(f"Add endpoint also failed: {add_response.status_code}")
-                        logger.error(f"Add response: {add_response.text}")
-                        failed_count += 1
-                        failed_images.append({
-                            "id": image_id,
-                            "error": f"API update failed: Update {update_response.status_code} - {update_response.text}, Add {add_response.status_code} - {add_response.text}"
-                        })
 
             except Exception as e:
                 failed_count += 1
@@ -1414,14 +1323,12 @@ def process_new_images():
                 features_list = features.tolist()
 
                 # Cập nhật vector features
-                request_payload = {
-                    "id": image_id,
-                    "vector": features_list
-                }
-                
                 update_response = session.put(
                     f"{API_URL}/image/update/vector_feature",
-                    json=request_payload,
+                    json={
+                        "id": image_id,
+                        "vector": features_list  # Send as List<Double> instead of string
+                    },
                     timeout=API_TIMEOUT
                 )
 
@@ -1430,29 +1337,11 @@ def process_new_images():
                     results["success"] += 1
                 else:
                     logger.error(f"Không thể cập nhật vector features: {update_response.status_code}")
-                    logger.error(f"Chi tiết lỗi API: {update_response.text}")
-                    logger.error(f"Request payload: {request_payload}")
-                    logger.error(f"Vector length: {len(features_list)}")
-                    
-                    # Try add endpoint if update fails
-                    logger.info("Trying add endpoint as fallback...")
-                    add_response = session.post(
-                        f"{API_URL}/image/add/vector_feature",
-                        json=request_payload,
-                        timeout=API_TIMEOUT
-                    )
-                    
-                    if add_response.status_code == 200:
-                        logger.info(f"Add endpoint succeeded for image {image_id}")
-                        results["success"] += 1
-                    else:
-                        logger.error(f"Add endpoint also failed: {add_response.status_code}")
-                        logger.error(f"Add response: {add_response.text}")
-                        results["failed"] += 1
-                        results["failed_images"].append({
-                            "id": image_id,
-                            "error": f"Lỗi cập nhật: {update_response.status_code} - {update_response.text}, Add: {add_response.status_code} - {add_response.text}"
-                        })
+                    results["failed"] += 1
+                    results["failed_images"].append({
+                        "id": image_id,
+                        "error": f"Lỗi cập nhật: {update_response.status_code}"
+                    })
 
             except Exception as e:
                 logger.error(f"Lỗi khi xử lý ảnh {image_id}: {str(e)}")
@@ -1592,18 +1481,15 @@ def update_single_vector_feature():
         features_list = features.tolist()
         logger.info(f"Đã trích xuất và chuẩn hóa đặc trưng thành công, độ dài vector: {len(features)}")
 
-        # Create request payload
-        request_payload = {
-            "id": image_id,
-            "vector": features_list
-        }
-
         # Cập nhật vector features
         try:
             logger.info(f"Gửi yêu cầu cập nhật vector features cho ảnh {image_id}")
             update_response = session.put(
                 f"{API_URL}/image/update/vector_feature",
-                json=request_payload,
+                json={
+                    "id": image_id,
+                    "vector": features_list  # Send as List<Double> instead of string
+                },
                 timeout=API_TIMEOUT
             )
             
@@ -1623,36 +1509,11 @@ def update_single_vector_feature():
             else:
                 logger.error(f"Lỗi khi cập nhật vector features: {update_response.status_code}")
                 logger.error(f"Chi tiết lỗi: {update_response.text}")
-                logger.error(f"Request payload: {request_payload}")
-                
-                # Try add endpoint if update fails
-                logger.info("Trying add endpoint as fallback...")
-                add_response = session.post(
-                    f"{API_URL}/image/add/vector_feature",
-                    json=request_payload,
-                    timeout=API_TIMEOUT
-                )
-                
-                if add_response.status_code == 200:
-                    # Sau khi thêm thành công, xóa cache
-                    invalidate_features_cache()
-                    invalidate_status_cache()
-                    logger.info(f"Đã thêm thành công vector features cho ảnh {image_id} và xóa cache")
-                    return jsonify({
-                        "message": "Thêm vector features thành công",
-                        "id": image_id,
-                        "path": image_path,
-                        "status": "success",
-                        "vector_length": len(features),
-                        "is_consistent": True
-                    }), 200
-                else:
-                    logger.error(f"Add endpoint also failed: {add_response.status_code}")
-                    logger.error(f"Add response: {add_response.text}")
-                    return jsonify({
-                        "error": f"Lỗi khi cập nhật/thêm vector features: Update {update_response.status_code} - {update_response.text}, Add {add_response.status_code} - {add_response.text}",
-                        "status": "error"
-                    }), update_response.status_code
+                return jsonify({
+                    "error": f"Lỗi khi cập nhật vector features: {update_response.status_code}",
+                    "details": update_response.text,
+                    "status": "error"
+                }), update_response.status_code
                 
         except requests.exceptions.Timeout:
             logger.error(f"Timeout khi cập nhật vector features cho ảnh {image_id}")
@@ -2113,16 +1974,13 @@ def fix_inconsistent_dimensions():
                 # Convert features to List<Double> format for Java API
                 features_list = features.tolist()
 
-                # Create request payload
-                request_payload = {
-                    "id": image_id,
-                    "vector": features_list
-                }
-
                 # Update vector features
                 update_response = session.put(
                     f"{API_URL}/image/update/vector_feature",
-                    json=request_payload,
+                    json={
+                        "id": image_id,
+                        "vector": features_list  # Send as List<Double> instead of string
+                    },
                     timeout=API_TIMEOUT
                 )
 
@@ -2131,29 +1989,11 @@ def fix_inconsistent_dimensions():
                     success_count += 1
                 else:
                     logger.error(f"Không thể cập nhật vector features: {update_response.status_code}")
-                    logger.error(f"Chi tiết lỗi API: {update_response.text}")
-                    logger.error(f"Request payload: {request_payload}")
-                    logger.error(f"Vector length: {len(features_list)}")
-                    
-                    # Try add endpoint if update fails
-                    logger.info("Trying add endpoint as fallback...")
-                    add_response = session.post(
-                        f"{API_URL}/image/add/vector_feature",
-                        json=request_payload,
-                        timeout=API_TIMEOUT
-                    )
-                    
-                    if add_response.status_code == 200:
-                        logger.info(f"Add endpoint succeeded for image {image_id}")
-                        success_count += 1
-                    else:
-                        logger.error(f"Add endpoint also failed: {add_response.status_code}")
-                        logger.error(f"Add response: {add_response.text}")
-                        failed_count += 1
-                        failed_images.append({
-                            "id": image_id,
-                            "error": f"Lỗi cập nhật: {update_response.status_code} - {update_response.text}, Add: {add_response.status_code} - {add_response.text}"
-                        })
+                    failed_count += 1
+                    failed_images.append({
+                        "id": image_id,
+                        "error": f"Lỗi cập nhật: {update_response.status_code}"
+                    })
 
             except Exception as e:
                 logger.error(f"Lỗi khi sửa chữa ảnh {image_id}: {str(e)}")
@@ -2189,75 +2029,6 @@ def fix_inconsistent_dimensions():
     except Exception as e:
         logger.error(f"Lỗi không mong muốn: {str(e)}")
         return jsonify({"error": str(e)}), 500
-
-@app.route("/api/test/vector_api", methods=["GET"])
-def test_vector_api():
-    """Test the vector API endpoint to see what the actual error is"""
-    try:
-        # Test the API connection
-        logger.info(f"Testing API connection to: {API_URL}")
-        
-        # First test the images endpoint
-        images_response = session.get(f"{API_URL}/images", timeout=API_TIMEOUT)
-        logger.info(f"Images endpoint response: {images_response.status_code}")
-        if images_response.status_code != 200:
-            logger.error(f"Images endpoint error: {images_response.text}")
-            return jsonify({
-                "error": "Cannot connect to images endpoint",
-                "status_code": images_response.status_code,
-                "response": images_response.text
-            }), 500
-        
-        # Get a sample image
-        data = images_response.json()
-        if isinstance(data, dict) and 'data' in data:
-            images = data['data']
-        else:
-            images = data if isinstance(data, list) else []
-        
-        if not images:
-            return jsonify({"error": "No images found in database"}), 400
-        
-        # Get the first image
-        sample_image = images[0]
-        image_id = sample_image.get('id')
-        
-        if not image_id:
-            return jsonify({"error": "Sample image has no ID"}), 400
-        
-        logger.info(f"Testing with sample image ID: {image_id}")
-        
-        # Create a test vector (2048 dimensions)
-        test_vector = [0.1] * 2048
-        
-        # Test the update endpoint
-        logger.info("Testing vector feature update endpoint")
-        update_response = session.put(
-            f"{API_URL}/image/update/vector_feature",
-            json={
-                "id": image_id,
-                "vector": test_vector
-            },
-            timeout=API_TIMEOUT
-        )
-        
-        logger.info(f"Update endpoint response: {update_response.status_code}")
-        logger.info(f"Update endpoint response text: {update_response.text}")
-        
-        return jsonify({
-            "api_url": API_URL,
-            "sample_image_id": image_id,
-            "update_status_code": update_response.status_code,
-            "update_response": update_response.text,
-            "test_vector_length": len(test_vector)
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"Error testing vector API: {str(e)}")
-        return jsonify({
-            "error": str(e),
-            "api_url": API_URL
-        }), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

@@ -62,73 +62,6 @@ VECTOR_DIMENSIONS_CONFIG = 2048
 _models = {}
 _model_lock = threading.Lock()
 
-# Thêm biến toàn cục để lưu cache cho status
-_status_cache = {
-    'data': None,
-    'last_update': None,
-    'lock': threading.Lock()
-}
-
-# Thời gian cache hết hạn cho status (5 phút)
-STATUS_CACHE_EXPIRY = 5 * 60  # seconds
-
-def get_cached_status():
-    """
-    Lấy trạng thái trích xuất từ cache hoặc tính toán mới
-    Returns:
-        dict: Trạng thái trích xuất
-    """
-    global _status_cache
-    
-    current_time = time.time()
-    
-    with _status_cache['lock']:
-        # Kiểm tra cache có hợp lệ không
-        if (_status_cache['data'] is not None and 
-            _status_cache['last_update'] is not None and 
-            current_time - _status_cache['last_update'] < STATUS_CACHE_EXPIRY):
-            logger.info("Sử dụng trạng thái từ cache")
-            return _status_cache['data']
-            
-        # Cache hết hạn hoặc chưa có, tính toán mới
-        logger.info("Cache hết hạn hoặc chưa có, tính toán trạng thái mới")
-        
-        with extraction_lock:
-            total_processed = extraction_status["processed_count"] + extraction_status["failed_count"]
-            progress = (total_processed / extraction_status["total_images"] * 100) if extraction_status["total_images"] > 0 else 0
-            
-            status_data = {
-                "is_running": extraction_status["is_running"],
-                "total_images": extraction_status["total_images"],
-                "processed_count": extraction_status["processed_count"],
-                "failed_count": extraction_status["failed_count"],
-                "current_image": extraction_status["current_image"],
-                "error": extraction_status["error"],
-                "progress": progress,
-                "status": "success",
-                "cached_at": current_time
-            }
-            
-            _status_cache['data'] = status_data
-            _status_cache['last_update'] = current_time
-            logger.info("Đã cập nhật cache trạng thái")
-            
-        return status_data
-
-def invalidate_status_cache():
-    """Xóa cache trạng thái để force tính toán mới"""
-    global _status_cache
-    with _status_cache['lock']:
-        _status_cache['data'] = None
-        _status_cache['last_update'] = None
-        logger.info("Đã xóa cache trạng thái")
-
-def invalidate_all_caches():
-    """Xóa tất cả cache trong hệ thống"""
-    invalidate_features_cache()
-    invalidate_status_cache()
-    logger.info("Đã xóa tất cả cache trong hệ thống")
-
 def get_model_for_dimensions(dimensions):
     """Get or create model for specified dimensions using only ResNet50 with 2048 dimensions"""
     global _models
@@ -194,14 +127,6 @@ logger = logging.getLogger(__name__)
 MIN_IMAGE_SIZE = 224  # Minimum size for feature extraction
 MAX_IMAGE_SIZE = 1024  # Maximum size to prevent memory issues
 QUALITY_THRESHOLD = 0.5  # Lowered quality threshold for images
-
-# Timeout settings for API calls (5 minutes)
-API_TIMEOUT = 300  # seconds
-REQUEST_TIMEOUT = 300  # seconds for requests.get()
-
-# Session with longer timeout
-session = requests.Session()
-session.timeout = REQUEST_TIMEOUT
 
 def preprocess_image(image_data):
     """Enhanced image preprocessing for better feature extraction"""
@@ -317,101 +242,23 @@ def send_vector_features(image_id, features):
         # Get vector dimensions
         vector_dimensions = len(features)
         
-        # Log the request details for debugging
-        logger.info(f"Sending vector features for image {image_id}")
-        logger.info(f"Vector dimensions: {vector_dimensions}")
-        logger.info(f"First 5 values: {features_list[:5]}")
-        logger.info(f"Last 5 values: {features_list[-5:]}")
+        # Send update request to API with List<Double> format
+        update_response = requests.put(
+            f"{API_URL}/image/update/vector_feature",
+            json={
+                "id": image_id,
+                "vector": features_list  # Send as List<Double> instead of string
+            }
+        )
         
-        # Create the request payload exactly as expected by Java VectorFeatureRequest
-        request_payload = {
-            "id": image_id,
-            "vector": features_list
-        }
-        
-        logger.info(f"Request payload: {request_payload}")
-        
-        # First check if the image exists in the database and has vectorFeatures
-        images_response = session.get(f"{API_URL}/images", timeout=API_TIMEOUT)
-        if images_response.status_code == 200:
-            data = images_response.json()
-            if isinstance(data, dict) and 'data' in data:
-                images = data['data']
-            else:
-                images = data if isinstance(data, list) else []
-            
-            # Find the specific image
-            image_data = next((img for img in images if img.get('id') == image_id), None)
-            if image_data:
-                logger.info(f"Image {image_id} found in database")
-                current_vector_features = image_data.get('vectorFeatures')
-                logger.info(f"Current vectorFeatures: {current_vector_features}")
-                
-                # Check if image already has vector features
-                has_vector_features = (
-                    current_vector_features and 
-                    isinstance(current_vector_features, list) and 
-                    len(current_vector_features) > 0
-                )
-                
-                if has_vector_features:
-                    logger.info(f"Image {image_id} already has vector features, trying update endpoint")
-                    # Try update endpoint first
-                    response = session.put(
-                        f"{API_URL}/image/update/vector_feature",
-                        json=request_payload,
-                        timeout=API_TIMEOUT
-                    )
-                    
-                    # If update fails, try add endpoint
-                    if response.status_code != 200:
-                        logger.warning(f"Update failed ({response.status_code}): {response.text}, trying add endpoint")
-                        response = session.post(
-                            f"{API_URL}/image/add/vector_feature",
-                            json=request_payload,
-                            timeout=API_TIMEOUT
-                        )
-                else:
-                    logger.info(f"Image {image_id} has no vector features, using add endpoint")
-                    # Use add endpoint
-                    response = session.post(
-                        f"{API_URL}/image/add/vector_feature",
-                        json=request_payload,
-                        timeout=API_TIMEOUT
-                    )
-            else:
-                logger.warning(f"Image {image_id} not found in database, using add endpoint")
-                # Use add endpoint for new images
-                response = session.post(
-                    f"{API_URL}/image/add/vector_feature",
-                    json=request_payload,
-                    timeout=API_TIMEOUT
-                )
-        else:
-            logger.warning(f"Could not fetch images from database: {images_response.status_code}, using add endpoint")
-            # Use add endpoint as fallback
-            response = session.post(
-                f"{API_URL}/image/add/vector_feature",
-                json=request_payload,
-                timeout=API_TIMEOUT
-            )
-        
-        if response.status_code == 200:
-            logger.info(f"Successfully processed vector features for image {image_id} with {vector_dimensions} dimensions")
+        if update_response.status_code == 200:
+            logger.info(f"Successfully updated vector features for image {image_id} with {vector_dimensions} dimensions")
             return True
         else:
-            logger.error(f"Failed to process vector features: {response.status_code}")
-            logger.error(f"Response: {response.text}")
-            logger.error(f"Request payload: {request_payload}")
-            logger.error(f"Vector length: {len(features_list)}")
+            logger.error(f"Failed to update vector features: {update_response.status_code}")
+            logger.error(f"Response: {update_response.text}")
             return False
             
-    except requests.exceptions.Timeout:
-        logger.error(f"Timeout when sending vector features for image {image_id}")
-        return False
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Request error when sending vector features: {str(e)}")
-        return False
     except Exception as e:
         logger.error(f"Error sending vector features: {str(e)}")
         return False
@@ -462,28 +309,25 @@ def augment_and_save_image(img_path, image_id, n_aug=5):
                 # Create unique ID for augmented image
                 aug_image_id = f"{image_id}_aug_{i}"
                 
-                # Convert features to List<Double> format for Java API
-                features_list = features.tolist()
-                
-                # Create request payload
-                request_payload = {
-                    "id": aug_image_id,
-                    "vector": features_list
-                }
+                # Convert features to string
+                features_str = ','.join(map(str, features))
                 
                 # Save to database
-                update_response = session.put(
+                update_response = requests.put(
                     f"{API_URL}/image/update/vector_feature",
-                    json=request_payload,
-                    timeout=API_TIMEOUT
+                    json={
+                        "id": aug_image_id,
+                        "vectorFeatures": features_str,
+                        "originalImageId": image_id,
+                        "isAugmented": True
+                    }
                 )
                 
                 if update_response.status_code == 200:
                     logger.info(f"Successfully saved augmented image {i} for {image_id}")
                     aug_results.append((aug_image_id, features))
                 else:
-                    logger.error(f"Failed to save augmented image {i} for {image_id}: {update_response.status_code}")
-                    logger.error(f"Response: {update_response.text}")
+                    logger.error(f"Failed to save augmented image {i} for {image_id}")
                     
             except Exception as e:
                 logger.error(f"Error processing augmented image {i} for {image_id}: {str(e)}")
@@ -498,8 +342,8 @@ def augment_and_save_image(img_path, image_id, n_aug=5):
 def process_single_image(image_url, image_id):
     """Process a single image with enhanced error handling and validation"""
     try:
-        # Download image with longer timeout
-        response = session.get(image_url, timeout=REQUEST_TIMEOUT)
+        # Download image
+        response = requests.get(image_url, timeout=10)
         if response.status_code != 200:
             logger.error(f"Failed to download image: {response.status_code}")
             return False, f"Failed to download image: {response.status_code}"
@@ -548,12 +392,6 @@ def process_single_image(image_url, image_id):
             if os.path.exists(temp_path):
                 os.remove(temp_path)
                 
-    except requests.exceptions.Timeout:
-        logger.error(f"Timeout when processing image {image_url}")
-        return False, "Timeout when downloading image"
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Request error when processing image {image_url}: {str(e)}")
-        return False, f"Request error: {str(e)}"
     except Exception as e:
         logger.error(f"Error processing image {image_url}: {str(e)}")
         return False, str(e)
@@ -654,8 +492,8 @@ def background_extraction(process_all=False):
             'progress': 0
         }
         
-        # Get all images with longer timeout
-        response = session.get(f"{API_URL}/images", timeout=API_TIMEOUT)
+        # Get all images
+        response = requests.get(f"{API_URL}/images")
         if response.status_code != 200:
             raise Exception("Failed to fetch images")
             
@@ -711,12 +549,6 @@ def background_extraction(process_all=False):
                 total = extraction_status['processed_count'] + extraction_status['failed_count']
                 extraction_status['progress'] = (total / extraction_status['total_images']) * 100 if extraction_status['total_images'] > 0 else 0
                 
-    except requests.exceptions.Timeout:
-        logger.error("Timeout during extraction process")
-        extraction_status['error'] = "Timeout during extraction process"
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Request error during extraction process: {str(e)}")
-        extraction_status['error'] = f"Request error: {str(e)}"
     except Exception as e:
         logger.error(f"Extraction process failed: {str(e)}")
         extraction_status['error'] = str(e)
@@ -838,51 +670,36 @@ def find_similar_images():
 @app.route("/api/extraction/status", methods=["GET"])
 def get_extraction_status():
     """Lấy trạng thái hiện tại của quá trình trích xuất đặc trưng"""
-    try:
-        # Sử dụng cache để lấy trạng thái
-        status_data = get_cached_status()
-        return jsonify(status_data), 200
-            
-    except Exception as e:
-        logger.error(f"Error getting extraction status: {str(e)}")
+    with extraction_lock:
         return jsonify({
-            "error": f"Lỗi khi lấy trạng thái trích xuất: {str(e)}",
-            "status": "error"
-        }), 500
+            "is_running": extraction_status["is_running"],
+            "total_images": extraction_status["total_images"],
+            "processed_count": extraction_status["processed_count"],
+            "failed_count": extraction_status["failed_count"],
+            "current_image": extraction_status["current_image"],
+            "error": extraction_status["error"],
+            "progress": (extraction_status["processed_count"] + extraction_status["failed_count"]) / 
+                       extraction_status["total_images"] * 100 if extraction_status["total_images"] > 0 else 0
+        })
 
 @app.route("/api/extraction/start", methods=["POST"])
 def start_extraction():
     """Bắt đầu quá trình trích xuất đặc trưng"""
-    try:
-        global extraction_status
-        
-        with extraction_lock:
-            if extraction_status["is_running"]:
-                return jsonify({
-                    "error": "Đang có quá trình trích xuất đang chạy",
-                    "status": "error"
-                }), 400
-        
-        data = request.get_json() or {}
-        process_all = data.get("process_all", False)
-        
-        # Chạy trong thread riêng
-        thread = threading.Thread(target=background_extraction, args=(process_all,))
-        thread.daemon = True
-        thread.start()
-        
-        return jsonify({
-            "message": "Đã bắt đầu quá trình trích xuất đặc trưng",
-            "process_all": process_all,
-            "status": "success"
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"Error starting extraction: {str(e)}")
-        return jsonify({
-            "error": f"Lỗi khi bắt đầu trích xuất: {str(e)}",
-            "status": "error"
-        }), 500
+    global extraction_status
+    
+    with extraction_lock:
+        if extraction_status["is_running"]:
+            return jsonify({"error": "Đang có quá trình trích xuất đang chạy"}), 400
+    
+    data = request.get_json() or {}
+    process_all = data.get("process_all", False)
+    
+    # Chạy trong thread riêng
+    thread = threading.Thread(target=background_extraction, args=(process_all,))
+    thread.daemon = True
+    thread.start()
+    
+    return jsonify({"message": "Đã bắt đầu quá trình trích xuất đặc trưng"})
 
 @app.route("/api/extraction/stop", methods=["POST"])
 def stop_extraction():
@@ -900,7 +717,7 @@ def stop_extraction():
 def get_extraction_stats():
     """Lấy thống kê về trạng thái trích xuất đặc trưng của tất cả ảnh"""
     try:
-        response = session.get(f"{API_URL}/images", timeout=API_TIMEOUT)
+        response = requests.get(f"{API_URL}/images")
         if response.status_code != 200:
             return jsonify({"error": "Không thể lấy danh sách ảnh từ API"}), 500
 
@@ -910,8 +727,7 @@ def get_extraction_stats():
 
         images = data["data"]
         total_images = len(images)
-        # Fix: vectorFeatures is now a list, not a string
-        images_with_features = sum(1 for img in images if img.get("vectorFeatures") and isinstance(img.get("vectorFeatures"), list) and len(img.get("vectorFeatures")) > 0)
+        images_with_features = sum(1 for img in images if img.get("vectorFeatures") and img.get("vectorFeatures").strip())
         
         # Thống kê theo product
         product_stats = {}
@@ -921,8 +737,7 @@ def get_extraction_stats():
                 if product_id not in product_stats:
                     product_stats[product_id] = {"total": 0, "with_features": 0}
                 product_stats[product_id]["total"] += 1
-                # Fix: vectorFeatures is now a list, not a string
-                if img.get("vectorFeatures") and isinstance(img.get("vectorFeatures"), list) and len(img.get("vectorFeatures")) > 0:
+                if img.get("vectorFeatures") and img.get("vectorFeatures").strip():
                     product_stats[product_id]["with_features"] += 1
 
         return jsonify({
@@ -933,10 +748,6 @@ def get_extraction_stats():
             "product_stats": product_stats
         }), 200
 
-    except requests.exceptions.Timeout:
-        return jsonify({"error": "Timeout khi lấy thống kê từ API"}), 500
-    except requests.exceptions.RequestException as e:
-        return jsonify({"error": f"Lỗi kết nối: {str(e)}"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -949,8 +760,8 @@ def get_all_image_features():
     - valid_indices: list of indices of valid features
     """
     try:
-        # Fetch all images from API with longer timeout
-        response = session.get(f"{API_URL}/images", timeout=API_TIMEOUT)
+        # Fetch all images from API
+        response = requests.get(f"{API_URL}/images")
         if response.status_code != 200:
             logger.error(f"Failed to fetch images: {response.status_code}")
             return None, None, None
@@ -1050,12 +861,6 @@ def get_all_image_features():
         logger.info(f"Successfully loaded {len(valid_features)} valid feature vectors")
         return features, filenames, valid_indices
 
-    except requests.exceptions.Timeout:
-        logger.error("Timeout when fetching image features from API")
-        return None, None, None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Request error when fetching image features: {str(e)}")
-        return None, None, None
     except Exception as e:
         logger.error(f"Error in get_all_image_features: {str(e)}")
         return None, None, None
@@ -1113,8 +918,8 @@ def extract_features_from_url(image_path_or_url):
     try:
         # Check if it's a URL or local file path
         if image_path_or_url.startswith(('http://', 'https://')):
-            # Download image from URL with longer timeout
-            response = session.get(image_path_or_url, timeout=REQUEST_TIMEOUT)
+            # Download image from URL
+            response = requests.get(image_path_or_url, timeout=10)
             if response.status_code != 200:
                 logger.error(f"Failed to download image: {response.status_code}")
                 return None
@@ -1151,12 +956,6 @@ def extract_features_from_url(image_path_or_url):
 
         return features
 
-    except requests.exceptions.Timeout:
-        logger.error(f"Timeout when downloading image from {image_path_or_url}")
-        return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Request error when downloading image from {image_path_or_url}: {str(e)}")
-        return None
     except Exception as e:
         logger.error(f"Error extracting features from {image_path_or_url}: {str(e)}")
         return None
@@ -1194,8 +993,8 @@ def get_extraction_details():
         if not image_url:
             return jsonify({'error': 'Image URL is required'}), 400
 
-        # Get image details from API with longer timeout
-        response = session.get(f"{API_URL}/images", params={'url': image_url}, timeout=API_TIMEOUT)
+        # Get image details from API
+        response = requests.get(f"{API_URL}/images", params={'url': image_url})
         if response.status_code != 200:
             return jsonify({'error': 'Failed to fetch image details'}), 500
 
@@ -1216,10 +1015,6 @@ def get_extraction_details():
 
         return jsonify(details)
 
-    except requests.exceptions.Timeout:
-        return jsonify({'error': 'Timeout when fetching image details'}), 500
-    except requests.exceptions.RequestException as e:
-        return jsonify({'error': f'Request error: {str(e)}'}), 500
     except Exception as e:
         logger.error(f"Error getting extraction details: {str(e)}")
         return jsonify({'error': str(e)}), 500
@@ -1228,8 +1023,8 @@ def get_extraction_details():
 def update_all_vector_features():
     """Update vector features for all images in the database"""
     try:
-        # Get all images from API with longer timeout
-        response = session.get(f"{API_URL}/images", timeout=API_TIMEOUT)
+        # Get all images from API
+        response = requests.get(f"{API_URL}/images")
         if response.status_code != 200:
             return jsonify({"error": "Failed to fetch images from API"}), 500
 
@@ -1264,52 +1059,31 @@ def update_all_vector_features():
                 if features is None:
                     logger.error(f"Failed to extract features for image {image_url}")
                     failed_count += 1
-                    failed_images.append({
-                        "id": image_id,
-                        "error": "Feature extraction failed"
-                    })
+                    failed_images.append({"id": image_id, "error": "Feature extraction failed"})
                     continue
 
                 # Convert features to List<Double> format for Java API
                 features_list = features.tolist()
 
                 # Update vector features in API
-                update_response = session.put(
+                update_response = requests.put(
                     f"{API_URL}/image/update/vector_feature",
                     json={
                         "id": image_id,
-                        "vector": features_list  # Send as List<Double> for Java VectorFeatureRequest
-                    },
-                    timeout=API_TIMEOUT
+                        "vector": features_list  # Send as List<Double> instead of string
+                    }
                 )
 
                 if update_response.status_code == 200:
                     success_count += 1
                     logger.info(f"Successfully updated features for image {image_id}")
                 else:
+                    failed_count += 1
+                    failed_images.append({
+                        "id": image_id,
+                        "error": f"API update failed: {update_response.status_code}"
+                    })
                     logger.error(f"Failed to update features for image {image_id}: {update_response.status_code}")
-                    logger.error(f"Update response: {update_response.text}")
-                    logger.error(f"Request payload: {request_payload}")
-                    
-                    # Try add endpoint if update fails
-                    logger.info("Trying add endpoint as fallback...")
-                    add_response = session.post(
-                        f"{API_URL}/image/add/vector_feature",
-                        json=request_payload,
-                        timeout=API_TIMEOUT
-                    )
-                    
-                    if add_response.status_code == 200:
-                        success_count += 1
-                        logger.info(f"Add endpoint succeeded for image {image_id}")
-                    else:
-                        logger.error(f"Add endpoint also failed: {add_response.status_code}")
-                        logger.error(f"Add response: {add_response.text}")
-                        failed_count += 1
-                        failed_images.append({
-                            "id": image_id,
-                            "error": f"API update failed: Update {update_response.status_code} - {update_response.text}, Add {add_response.status_code} - {add_response.text}"
-                        })
 
             except Exception as e:
                 failed_count += 1
@@ -1321,7 +1095,6 @@ def update_all_vector_features():
 
         # Sau khi cập nhật xong, xóa cache
         invalidate_features_cache()
-        invalidate_status_cache()
         logger.info("Đã cập nhật xong tất cả vector features và xóa cache")
 
         return jsonify({
@@ -1332,10 +1105,6 @@ def update_all_vector_features():
             "failed_images": failed_images
         }), 200
 
-    except requests.exceptions.Timeout:
-        return jsonify({"error": "Timeout when updating vector features"}), 500
-    except requests.exceptions.RequestException as e:
-        return jsonify({"error": f"Request error: {str(e)}"}), 500
     except Exception as e:
         logger.error(f"Error in update_all_vector_features: {str(e)}")
         return jsonify({"error": str(e)}), 500
@@ -1346,8 +1115,8 @@ def process_new_images():
     try:
         logger.info("=== BẮT ĐẦU XỬ LÝ ẢNH MỚI ===")
         
-        # Lấy danh sách ảnh từ API với timeout dài hơn
-        response = session.get(f"{API_URL}/images", timeout=API_TIMEOUT)
+        # Lấy danh sách ảnh từ API
+        response = requests.get(f"{API_URL}/images")
         if response.status_code != 200:
             logger.error(f"Không thể lấy danh sách ảnh: {response.status_code}")
             return jsonify({"error": "Không thể lấy danh sách ảnh từ API"}), 500
@@ -1365,7 +1134,7 @@ def process_new_images():
         # Lọc ra những ảnh chưa có vector features
         images_to_process = [
             img for img in images 
-            if not img.get('vectorFeatures') or not isinstance(img.get('vectorFeatures'), list) or len(img.get('vectorFeatures')) == 0
+            if not img.get('vectorFeatures') or not img.get('vectorFeatures').strip()
         ]
 
         logger.info(f"Tổng số ảnh: {len(images)}")
@@ -1414,15 +1183,12 @@ def process_new_images():
                 features_list = features.tolist()
 
                 # Cập nhật vector features
-                request_payload = {
-                    "id": image_id,
-                    "vector": features_list
-                }
-                
-                update_response = session.put(
+                update_response = requests.put(
                     f"{API_URL}/image/update/vector_feature",
-                    json=request_payload,
-                    timeout=API_TIMEOUT
+                    json={
+                        "id": image_id,
+                        "vector": features_list  # Send as List<Double> instead of string
+                    }
                 )
 
                 if update_response.status_code == 200:
@@ -1430,29 +1196,11 @@ def process_new_images():
                     results["success"] += 1
                 else:
                     logger.error(f"Không thể cập nhật vector features: {update_response.status_code}")
-                    logger.error(f"Chi tiết lỗi API: {update_response.text}")
-                    logger.error(f"Request payload: {request_payload}")
-                    logger.error(f"Vector length: {len(features_list)}")
-                    
-                    # Try add endpoint if update fails
-                    logger.info("Trying add endpoint as fallback...")
-                    add_response = session.post(
-                        f"{API_URL}/image/add/vector_feature",
-                        json=request_payload,
-                        timeout=API_TIMEOUT
-                    )
-                    
-                    if add_response.status_code == 200:
-                        logger.info(f"Add endpoint succeeded for image {image_id}")
-                        results["success"] += 1
-                    else:
-                        logger.error(f"Add endpoint also failed: {add_response.status_code}")
-                        logger.error(f"Add response: {add_response.text}")
-                        results["failed"] += 1
-                        results["failed_images"].append({
-                            "id": image_id,
-                            "error": f"Lỗi cập nhật: {update_response.status_code} - {update_response.text}, Add: {add_response.status_code} - {add_response.text}"
-                        })
+                    results["failed"] += 1
+                    results["failed_images"].append({
+                        "id": image_id,
+                        "error": f"Lỗi cập nhật: {update_response.status_code}"
+                    })
 
             except Exception as e:
                 logger.error(f"Lỗi khi xử lý ảnh {image_id}: {str(e)}")
@@ -1464,7 +1212,6 @@ def process_new_images():
 
         # Sau khi xử lý xong, xóa cache
         invalidate_features_cache()
-        invalidate_status_cache()
         logger.info("Đã xử lý xong ảnh mới và xóa cache")
 
         logger.info("=== KẾT THÚC XỬ LÝ ẢNH MỚI ===")
@@ -1475,12 +1222,6 @@ def process_new_images():
             "results": results
         }), 200
 
-    except requests.exceptions.Timeout:
-        logger.error("Timeout khi xử lý ảnh mới")
-        return jsonify({"error": "Timeout khi xử lý ảnh mới"}), 500
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Lỗi kết nối khi xử lý ảnh mới: {str(e)}")
-        return jsonify({"error": f"Lỗi kết nối: {str(e)}"}), 500
     except Exception as e:
         logger.error(f"Lỗi không mong muốn: {str(e)}")
         return jsonify({"error": str(e)}), 500
@@ -1510,7 +1251,7 @@ def update_single_vector_feature():
         # Lấy tất cả ảnh từ API và tìm ảnh cần xử lý
         try:
             logger.info("Lấy danh sách ảnh từ API public")
-            response = session.get(f"{API_URL}/images", timeout=API_TIMEOUT)
+            response = requests.get(f"{API_URL}/images")
             
             if response.status_code != 200:
                 logger.error(f"Lỗi khi lấy danh sách ảnh từ API public: {response.status_code}")
@@ -1537,10 +1278,7 @@ def update_single_vector_feature():
             logger.info(f"Vector features của ảnh {image_id}:")
             logger.info(f"- Có vector features: {bool(vector_features)}")
             logger.info(f"- Độ dài vector: {len(vector_features) if vector_features else 0}")
-            if isinstance(vector_features, list):
-                logger.info(f"- Vector features (preview): {vector_features[:5]}... (total {len(vector_features)})" if len(vector_features) > 10 else f"- Vector features: {vector_features}")
-            else:
-                logger.info(f"- Vector features: {str(vector_features)[:100]}..." if vector_features and len(str(vector_features)) > 100 else f"- Vector features: {vector_features}")
+            logger.info(f"- Vector features: {vector_features[:100] + '...' if vector_features and len(vector_features) > 100 else vector_features}")
 
             # Kiểm tra kỹ hơn về vector features và chiều vector
             has_valid_features = (
@@ -1566,12 +1304,6 @@ def update_single_vector_feature():
                 else:
                     logger.info(f"Ảnh {image_id} chưa có vector features hợp lệ, tiếp tục xử lý")
                 
-        except requests.exceptions.Timeout:
-            logger.error("Timeout khi lấy danh sách ảnh")
-            return jsonify({"error": "Timeout khi lấy danh sách ảnh từ hệ thống"}), 500
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Lỗi kết nối khi lấy danh sách ảnh: {str(e)}")
-            return jsonify({"error": "Lỗi kết nối khi lấy danh sách ảnh từ hệ thống"}), 500
         except Exception as e:
             logger.error(f"Lỗi khi kiểm tra thông tin ảnh: {str(e)}")
             logger.error(f"Chi tiết lỗi: {str(e)}")
@@ -1592,25 +1324,20 @@ def update_single_vector_feature():
         features_list = features.tolist()
         logger.info(f"Đã trích xuất và chuẩn hóa đặc trưng thành công, độ dài vector: {len(features)}")
 
-        # Create request payload
-        request_payload = {
-            "id": image_id,
-            "vector": features_list
-        }
-
         # Cập nhật vector features
         try:
             logger.info(f"Gửi yêu cầu cập nhật vector features cho ảnh {image_id}")
-            update_response = session.put(
+            update_response = requests.put(
                 f"{API_URL}/image/update/vector_feature",
-                json=request_payload,
-                timeout=API_TIMEOUT
+                json={
+                    "id": image_id,
+                    "vector": features_list  # Send as List<Double> instead of string
+                }
             )
             
             if update_response.status_code == 200:
                 # Sau khi cập nhật thành công, xóa cache
                 invalidate_features_cache()
-                invalidate_status_cache()
                 logger.info(f"Đã cập nhật thành công vector features cho ảnh {image_id} và xóa cache")
                 return jsonify({
                     "message": "Cập nhật vector features thành công",
@@ -1623,49 +1350,12 @@ def update_single_vector_feature():
             else:
                 logger.error(f"Lỗi khi cập nhật vector features: {update_response.status_code}")
                 logger.error(f"Chi tiết lỗi: {update_response.text}")
-                logger.error(f"Request payload: {request_payload}")
+                return jsonify({
+                    "error": f"Lỗi khi cập nhật vector features: {update_response.status_code}",
+                    "details": update_response.text,
+                    "status": "error"
+                }), update_response.status_code
                 
-                # Try add endpoint if update fails
-                logger.info("Trying add endpoint as fallback...")
-                add_response = session.post(
-                    f"{API_URL}/image/add/vector_feature",
-                    json=request_payload,
-                    timeout=API_TIMEOUT
-                )
-                
-                if add_response.status_code == 200:
-                    # Sau khi thêm thành công, xóa cache
-                    invalidate_features_cache()
-                    invalidate_status_cache()
-                    logger.info(f"Đã thêm thành công vector features cho ảnh {image_id} và xóa cache")
-                    return jsonify({
-                        "message": "Thêm vector features thành công",
-                        "id": image_id,
-                        "path": image_path,
-                        "status": "success",
-                        "vector_length": len(features),
-                        "is_consistent": True
-                    }), 200
-                else:
-                    logger.error(f"Add endpoint also failed: {add_response.status_code}")
-                    logger.error(f"Add response: {add_response.text}")
-                    return jsonify({
-                        "error": f"Lỗi khi cập nhật/thêm vector features: Update {update_response.status_code} - {update_response.text}, Add {add_response.status_code} - {add_response.text}",
-                        "status": "error"
-                    }), update_response.status_code
-                
-        except requests.exceptions.Timeout:
-            logger.error(f"Timeout khi cập nhật vector features cho ảnh {image_id}")
-            return jsonify({
-                "error": "Timeout khi cập nhật vector features",
-                "status": "error"
-            }), 500
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Lỗi kết nối khi cập nhật vector features: {str(e)}")
-            return jsonify({
-                "error": f"Lỗi kết nối: {str(e)}",
-                "status": "error"
-            }), 500
         except Exception as e:
             logger.error(f"Lỗi khi cập nhật vector features: {str(e)}")
             logger.error(f"Chi tiết lỗi: {str(e)}")
@@ -1690,8 +1380,8 @@ def get_product_images():
         if not product_id:
             return jsonify({"error": "Missing productId parameter"}), 400
 
-        # Get images from API with longer timeout
-        response = session.get(f"{API_URL}/images", params={"productId": product_id}, timeout=API_TIMEOUT)
+        # Get images from API
+        response = requests.get(f"{API_URL}/images", params={"productId": product_id})
         if response.status_code != 200:
             logger.error(f"Failed to fetch images: {response.status_code}")
             return jsonify({"error": "Failed to fetch images"}), 500
@@ -1717,10 +1407,6 @@ def get_product_images():
             "images": formatted_images
         }), 200
 
-    except requests.exceptions.Timeout:
-        return jsonify({"error": "Timeout when fetching product images"}), 500
-    except requests.exceptions.RequestException as e:
-        return jsonify({"error": f"Request error: {str(e)}"}), 500
     except Exception as e:
         logger.error(f"Error getting product images: {str(e)}")
         return jsonify({"error": str(e)}), 500
@@ -1729,8 +1415,8 @@ def get_product_images():
 def get_products():
     """Get all products with their image statistics"""
     try:
-        # Get all images from API with longer timeout
-        response = session.get(f"{API_URL}/images", timeout=API_TIMEOUT)
+        # Get all images from API
+        response = requests.get(f"{API_URL}/images")
         if response.status_code != 200:
             logger.error(f"Failed to fetch images: {response.status_code}")
             return jsonify({"error": "Failed to fetch images"}), 500
@@ -1801,10 +1487,6 @@ def get_products():
             ) if sum(p['total_images'] for p in products) > 0 else 0
         }), 200
 
-    except requests.exceptions.Timeout:
-        return jsonify({"error": "Timeout when fetching products"}), 500
-    except requests.exceptions.RequestException as e:
-        return jsonify({"error": f"Request error: {str(e)}"}), 500
     except Exception as e:
         logger.error(f"Error getting products: {str(e)}")
         return jsonify({"error": str(e)}), 500
@@ -1813,127 +1495,18 @@ def get_products():
 def clear_features_cache():
     """Xóa cache để force lấy dữ liệu mới"""
     try:
-        data = request.get_json() or {}
-        cache_type = data.get('cache_type', 'all')  # 'features', 'status', 'all'
-        
-        if cache_type == 'features':
-            invalidate_features_cache()
-            message = "Cache features đã được xóa thành công"
-        elif cache_type == 'status':
-            invalidate_status_cache()
-            message = "Cache status đã được xóa thành công"
-        elif cache_type == 'all':
-            invalidate_all_caches()
-            message = "Tất cả cache đã được xóa thành công"
-        else:
-            return jsonify({
-                "error": "Loại cache không hợp lệ. Sử dụng: 'features', 'status', 'all'",
-                "status": "error"
-            }), 400
-            
-        return jsonify({
-            "message": message,
-            "cache_type": cache_type,
-            "status": "success"
-        }), 200
-        
+        invalidate_features_cache()
+        return jsonify({"message": "Cache đã được xóa thành công"}), 200
     except Exception as e:
         logger.error(f"Lỗi khi xóa cache: {str(e)}")
-        return jsonify({
-            "error": f"Lỗi khi xóa cache: {str(e)}",
-            "status": "error"
-        }), 500
-
-@app.route("/api/extraction/cache_info", methods=["GET"])
-def get_cache_info():
-    """Lấy thông tin về cache hiện tại"""
-    try:
-        current_time = time.time()
-        
-        # Thông tin cache features
-        features_cache_info = {
-            "has_data": _features_cache['data'] is not None,
-            "last_update": _features_cache['last_update'],
-            "age_seconds": current_time - _features_cache['last_update'] if _features_cache['last_update'] else None,
-            "expires_in_seconds": CACHE_EXPIRY - (current_time - _features_cache['last_update']) if _features_cache['last_update'] else None,
-            "is_valid": (_features_cache['data'] is not None and 
-                        _features_cache['last_update'] is not None and 
-                        current_time - _features_cache['last_update'] < CACHE_EXPIRY)
-        }
-        
-        # Thông tin cache status
-        status_cache_info = {
-            "has_data": _status_cache['data'] is not None,
-            "last_update": _status_cache['last_update'],
-            "age_seconds": current_time - _status_cache['last_update'] if _status_cache['last_update'] else None,
-            "expires_in_seconds": STATUS_CACHE_EXPIRY - (current_time - _status_cache['last_update']) if _status_cache['last_update'] else None,
-            "is_valid": (_status_cache['data'] is not None and 
-                        _status_cache['last_update'] is not None and 
-                        current_time - _status_cache['last_update'] < STATUS_CACHE_EXPIRY)
-        }
-        
-        return jsonify({
-            "features_cache": features_cache_info,
-            "status_cache": status_cache_info,
-            "current_time": current_time,
-            "status": "success"
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"Lỗi khi lấy thông tin cache: {str(e)}")
-        return jsonify({
-            "error": f"Lỗi khi lấy thông tin cache: {str(e)}",
-            "status": "error"
-        }), 500
-
-@app.route("/api/extraction/refresh_cache", methods=["POST"])
-def refresh_cache():
-    """Làm mới cache bằng cách xóa và tính toán lại"""
-    try:
-        data = request.get_json() or {}
-        cache_type = data.get('cache_type', 'all')  # 'features', 'status', 'all'
-        
-        if cache_type == 'features':
-            invalidate_features_cache()
-            # Force tính toán lại features
-            get_cached_features()
-            message = "Cache features đã được làm mới thành công"
-        elif cache_type == 'status':
-            invalidate_status_cache()
-            # Force tính toán lại status
-            get_cached_status()
-            message = "Cache status đã được làm mới thành công"
-        elif cache_type == 'all':
-            invalidate_all_caches()
-            # Force tính toán lại tất cả
-            get_cached_features()
-            get_cached_status()
-            message = "Tất cả cache đã được làm mới thành công"
-        else:
-            return jsonify({
-                "error": "Loại cache không hợp lệ. Sử dụng: 'features', 'status', 'all'",
-                "status": "error"
-            }), 400
-            
-        return jsonify({
-            "message": message,
-            "cache_type": cache_type,
-            "status": "success"
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"Lỗi khi làm mới cache: {str(e)}")
-        return jsonify({
-            "error": f"Lỗi khi làm mới cache: {str(e)}",
-            "status": "error"
-        }), 500
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/extraction/vector_dimensions", methods=["GET"])
 def get_vector_dimensions_info():
     """Get information about vector dimensions across all images"""
     try:
-        # Get all images from API with longer timeout
-        response = session.get(f"{API_URL}/images", timeout=API_TIMEOUT)
+        # Get all images from API
+        response = requests.get(f"{API_URL}/images")
         if response.status_code != 200:
             return jsonify({"error": "Failed to fetch images from API"}), 500
 
@@ -2026,13 +1599,37 @@ def get_vector_dimensions_info():
             "is_system_consistent": len(inconsistent_dimensions) == 0 and len(images_with_features) > 0
         }), 200
 
-    except requests.exceptions.Timeout:
-        return jsonify({"error": "Timeout when fetching vector dimensions info"}), 500
-    except requests.exceptions.RequestException as e:
-        return jsonify({"error": f"Request error: {str(e)}"}), 500
     except Exception as e:
         logger.error(f"Error getting vector dimensions info: {str(e)}")
         return jsonify({"error": str(e)}), 500
+
+@app.route("/api/extraction/config", methods=["GET", "POST"])
+def configure_extraction():
+    """Configure extraction settings and get current configuration - FIXED TO 2048 DIMENSIONS"""
+    global VECTOR_DIMENSIONS_CONFIG
+    
+    if request.method == "GET":
+        # Get current configuration - always 2048
+        current_dimensions = VECTOR_DIMENSIONS_CONFIG
+        
+        # Always use ResNet50 for 2048 dimensions
+        model_type = "ResNet50"
+        
+        return jsonify({
+            "vector_dimensions": current_dimensions,
+            "model_type": model_type,
+            "available_dimensions": [2048],  # Only 2048 is supported
+            "description": "Sử dụng ResNet50 với GlobalMaxPooling2D cho 2048 chiều vector (cố định)",
+            "is_fixed": True
+        }), 200
+    
+    elif request.method == "POST":
+        # Configuration is fixed to 2048 dimensions
+        return jsonify({
+            "error": "Vector dimensions are fixed to 2048 and cannot be changed",
+            "current_dimensions": VECTOR_DIMENSIONS_CONFIG,
+            "message": "Hệ thống chỉ hỗ trợ 2048 chiều vector"
+        }), 400
 
 @app.route("/api/extraction/fix_dimensions", methods=["POST"])
 def fix_inconsistent_dimensions():
@@ -2040,8 +1637,8 @@ def fix_inconsistent_dimensions():
     try:
         logger.info("=== BẮT ĐẦU SỬA CHỮA CHIỀU VECTOR KHÔNG NHẤT QUÁN ===")
         
-        # Get vector dimensions info with longer timeout
-        response = session.get(f"{API_URL}/images", timeout=API_TIMEOUT)
+        # Get vector dimensions info
+        response = requests.get(f"{API_URL}/images")
         if response.status_code != 200:
             return jsonify({"error": "Failed to fetch images from API"}), 500
 
@@ -2113,17 +1710,13 @@ def fix_inconsistent_dimensions():
                 # Convert features to List<Double> format for Java API
                 features_list = features.tolist()
 
-                # Create request payload
-                request_payload = {
-                    "id": image_id,
-                    "vector": features_list
-                }
-
                 # Update vector features
-                update_response = session.put(
+                update_response = requests.put(
                     f"{API_URL}/image/update/vector_feature",
-                    json=request_payload,
-                    timeout=API_TIMEOUT
+                    json={
+                        "id": image_id,
+                        "vector": features_list  # Send as List<Double> instead of string
+                    }
                 )
 
                 if update_response.status_code == 200:
@@ -2131,29 +1724,11 @@ def fix_inconsistent_dimensions():
                     success_count += 1
                 else:
                     logger.error(f"Không thể cập nhật vector features: {update_response.status_code}")
-                    logger.error(f"Chi tiết lỗi API: {update_response.text}")
-                    logger.error(f"Request payload: {request_payload}")
-                    logger.error(f"Vector length: {len(features_list)}")
-                    
-                    # Try add endpoint if update fails
-                    logger.info("Trying add endpoint as fallback...")
-                    add_response = session.post(
-                        f"{API_URL}/image/add/vector_feature",
-                        json=request_payload,
-                        timeout=API_TIMEOUT
-                    )
-                    
-                    if add_response.status_code == 200:
-                        logger.info(f"Add endpoint succeeded for image {image_id}")
-                        success_count += 1
-                    else:
-                        logger.error(f"Add endpoint also failed: {add_response.status_code}")
-                        logger.error(f"Add response: {add_response.text}")
-                        failed_count += 1
-                        failed_images.append({
-                            "id": image_id,
-                            "error": f"Lỗi cập nhật: {update_response.status_code} - {update_response.text}, Add: {add_response.status_code} - {add_response.text}"
-                        })
+                    failed_count += 1
+                    failed_images.append({
+                        "id": image_id,
+                        "error": f"Lỗi cập nhật: {update_response.status_code}"
+                    })
 
             except Exception as e:
                 logger.error(f"Lỗi khi sửa chữa ảnh {image_id}: {str(e)}")
@@ -2165,7 +1740,6 @@ def fix_inconsistent_dimensions():
 
         # Invalidate cache
         invalidate_features_cache()
-        invalidate_status_cache()
         logger.info("Đã sửa chữa xong và xóa cache")
 
         logger.info("=== KẾT THÚC SỬA CHỮA CHIỀU VECTOR KHÔNG NHẤT QUÁN ===")
@@ -2180,84 +1754,9 @@ def fix_inconsistent_dimensions():
             "failed_images": failed_images
         }), 200
 
-    except requests.exceptions.Timeout:
-        logger.error("Timeout khi sửa chữa chiều vector")
-        return jsonify({"error": "Timeout khi sửa chữa chiều vector"}), 500
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Lỗi kết nối khi sửa chữa chiều vector: {str(e)}")
-        return jsonify({"error": f"Lỗi kết nối: {str(e)}"}), 500
     except Exception as e:
         logger.error(f"Lỗi không mong muốn: {str(e)}")
         return jsonify({"error": str(e)}), 500
-
-@app.route("/api/test/vector_api", methods=["GET"])
-def test_vector_api():
-    """Test the vector API endpoint to see what the actual error is"""
-    try:
-        # Test the API connection
-        logger.info(f"Testing API connection to: {API_URL}")
-        
-        # First test the images endpoint
-        images_response = session.get(f"{API_URL}/images", timeout=API_TIMEOUT)
-        logger.info(f"Images endpoint response: {images_response.status_code}")
-        if images_response.status_code != 200:
-            logger.error(f"Images endpoint error: {images_response.text}")
-            return jsonify({
-                "error": "Cannot connect to images endpoint",
-                "status_code": images_response.status_code,
-                "response": images_response.text
-            }), 500
-        
-        # Get a sample image
-        data = images_response.json()
-        if isinstance(data, dict) and 'data' in data:
-            images = data['data']
-        else:
-            images = data if isinstance(data, list) else []
-        
-        if not images:
-            return jsonify({"error": "No images found in database"}), 400
-        
-        # Get the first image
-        sample_image = images[0]
-        image_id = sample_image.get('id')
-        
-        if not image_id:
-            return jsonify({"error": "Sample image has no ID"}), 400
-        
-        logger.info(f"Testing with sample image ID: {image_id}")
-        
-        # Create a test vector (2048 dimensions)
-        test_vector = [0.1] * 2048
-        
-        # Test the update endpoint
-        logger.info("Testing vector feature update endpoint")
-        update_response = session.put(
-            f"{API_URL}/image/update/vector_feature",
-            json={
-                "id": image_id,
-                "vector": test_vector
-            },
-            timeout=API_TIMEOUT
-        )
-        
-        logger.info(f"Update endpoint response: {update_response.status_code}")
-        logger.info(f"Update endpoint response text: {update_response.text}")
-        
-        return jsonify({
-            "api_url": API_URL,
-            "sample_image_id": image_id,
-            "update_status_code": update_response.status_code,
-            "update_response": update_response.text,
-            "test_vector_length": len(test_vector)
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"Error testing vector API: {str(e)}")
-        return jsonify({
-            "error": str(e),
-            "api_url": API_URL
-        }), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

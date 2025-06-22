@@ -1,10 +1,9 @@
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS  # Import CORS
 import os
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.applications.efficientnet import EfficientNetB3, preprocess_input
+from tensorflow.keras.applications.resnet50 import ResNet50, preprocess_input
 from tensorflow.keras.preprocessing import image
 from tensorflow.keras.layers import GlobalMaxPooling2D
 from sklearn.metrics.pairwise import cosine_similarity
@@ -26,14 +25,22 @@ import json
 from sklearn.decomposition import PCA
 from tensorflow.keras.preprocessing.image import ImageDataGenerator, load_img, img_to_array
 import time
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import seaborn as sns
+from datetime import datetime
+import base64
+import csv
+from io import StringIO
 
 app = Flask(__name__)
 
 # Enable CORS for all origins
 CORS(app, supports_credentials=True, origins="*", allow_headers="*")
 # CORS(app, supports_credentials=True, origins=["http://localhost:3000"], allow_headers="*")
-# Load EfficientNetB3 model
-base_model = EfficientNetB3(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+# Load ResNet50 model
+base_model = ResNet50(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
 base_model.trainable = False
 model = tf.keras.Sequential([base_model, GlobalMaxPooling2D()])
 # Khởi tạo StandardScaler và OneHotEncoder
@@ -55,6 +62,434 @@ extraction_status = {
     "error": None
 }
 extraction_lock = threading.Lock()
+
+# Global variable for configurable vector dimensions
+VECTOR_DIMENSIONS_CONFIG = 2048
+
+# Global variables for models
+_models = {}
+_model_lock = threading.Lock()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Constants for image processing
+MIN_IMAGE_SIZE = 224  # Minimum size for feature extraction
+MAX_IMAGE_SIZE = 1024  # Maximum size to prevent memory issues
+QUALITY_THRESHOLD = 0.5  # Lowered quality threshold for images
+
+# Global variables for performance tracking
+performance_metrics = {
+    "extraction_times": [],  # List of extraction times in seconds
+    "search_times": [],      # List of search times in milliseconds
+    "accuracy_scores": [],   # List of accuracy scores
+    "total_images_processed": 0,
+    "total_searches_performed": 0,
+    "last_updated": None
+}
+
+performance_lock = threading.Lock()
+
+def record_extraction_time(extraction_time_seconds):
+    """Ghi lại thời gian trích xuất đặc trưng"""
+    global performance_metrics
+    with performance_lock:
+        performance_metrics["extraction_times"].append(extraction_time_seconds)
+        performance_metrics["total_images_processed"] += 1
+        performance_metrics["last_updated"] = datetime.now()
+        
+        # Giữ lại tối đa 1000 mẫu để tránh memory leak
+        if len(performance_metrics["extraction_times"]) > 1000:
+            performance_metrics["extraction_times"] = performance_metrics["extraction_times"][-1000:]
+
+def record_search_time(search_time_ms):
+    """Ghi lại thời gian tìm kiếm"""
+    global performance_metrics
+    with performance_lock:
+        performance_metrics["search_times"].append(search_time_ms)
+        performance_metrics["total_searches_performed"] += 1
+        performance_metrics["last_updated"] = datetime.now()
+        
+        # Giữ lại tối đa 1000 mẫu
+        if len(performance_metrics["search_times"]) > 1000:
+            performance_metrics["search_times"] = performance_metrics["search_times"][-1000:]
+
+def record_accuracy_score(accuracy):
+    """Ghi lại độ chính xác"""
+    global performance_metrics
+    with performance_lock:
+        performance_metrics["accuracy_scores"].append(accuracy)
+        performance_metrics["last_updated"] = datetime.now()
+        
+        # Giữ lại tối đa 1000 mẫu
+        if len(performance_metrics["accuracy_scores"]) > 1000:
+            performance_metrics["accuracy_scores"] = performance_metrics["accuracy_scores"][-1000:]
+
+def get_performance_statistics():
+    """Lấy thống kê hiệu năng thực tế"""
+    global performance_metrics
+    with performance_lock:
+        stats = {
+            "extraction_performance": {
+                "avg_time_per_image": 0,
+                "min_time": 0,
+                "max_time": 0,
+                "total_images": performance_metrics["total_images_processed"]
+            },
+            "search_performance": {
+                "avg_time_per_search": 0,
+                "min_time": 0,
+                "max_time": 0,
+                "total_searches": performance_metrics["total_searches_performed"]
+            },
+            "accuracy": {
+                "avg_accuracy": 0,
+                "min_accuracy": 0,
+                "max_accuracy": 0,
+                "total_measurements": 0
+            },
+            "last_updated": performance_metrics["last_updated"]
+        }
+        
+        # Tính toán thống kê trích xuất
+        if performance_metrics["extraction_times"]:
+            times = performance_metrics["extraction_times"]
+            stats["extraction_performance"]["avg_time_per_image"] = sum(times) / len(times)
+            stats["extraction_performance"]["min_time"] = min(times)
+            stats["extraction_performance"]["max_time"] = max(times)
+        
+        # Tính toán thống kê tìm kiếm
+        if performance_metrics["search_times"]:
+            times = performance_metrics["search_times"]
+            stats["search_performance"]["avg_time_per_search"] = sum(times) / len(times)
+            stats["search_performance"]["min_time"] = min(times)
+            stats["search_performance"]["max_time"] = max(times)
+        
+        # Tính toán thống kê độ chính xác
+        if performance_metrics["accuracy_scores"]:
+            scores = performance_metrics["accuracy_scores"]
+            stats["accuracy"]["avg_accuracy"] = sum(scores) / len(scores)
+            stats["accuracy"]["min_accuracy"] = min(scores)
+            stats["accuracy"]["max_accuracy"] = max(scores)
+            stats["accuracy"]["total_measurements"] = len(scores)
+        
+        return stats
+
+def create_performance_chart():
+    """Tạo biểu đồ hiệu năng từ dữ liệu thực tế"""
+    try:
+        # Tạo thư mục chart nếu chưa có
+        os.makedirs('chart', exist_ok=True)
+        
+        # Lấy thống kê hiệu năng thực tế
+        stats = get_performance_statistics()
+        
+        # Chuẩn bị dữ liệu cho biểu đồ
+        metrics = []
+        values = []
+        colors = []
+        
+        # Hiệu năng trích xuất (giây/ảnh)
+        if stats["extraction_performance"]["total_images"] > 0:
+            metrics.append('Hiệu năng\n(giây/ảnh)')
+            values.append(round(stats["extraction_performance"]["avg_time_per_image"], 2))
+            colors.append('#FF6B6B')
+        else:
+            metrics.append('Hiệu năng\n(giây/ảnh)')
+            values.append(0)  # Chưa có dữ liệu
+            colors.append('#FF6B6B')
+        
+        # Tốc độ tìm kiếm (ms/ảnh)
+        if stats["search_performance"]["total_searches"] > 0:
+            metrics.append('Tốc độ tìm kiếm\n(ms/ảnh)')
+            values.append(round(stats["search_performance"]["avg_time_per_search"], 2))
+            colors.append('#4ECDC4')
+        else:
+            metrics.append('Tốc độ tìm kiếm\n(ms/ảnh)')
+            values.append(0)  # Chưa có dữ liệu
+            colors.append('#4ECDC4')
+        
+        # Độ chính xác (%)
+        if stats["accuracy"]["total_measurements"] > 0:
+            metrics.append('Độ chính xác\n(%)')
+            values.append(round(stats["accuracy"]["avg_accuracy"] * 100, 1))
+            colors.append('#45B7D1')
+        else:
+            metrics.append('Độ chính xác\n(%)')
+            values.append(0)  # Chưa có dữ liệu
+            colors.append('#45B7D1')
+        
+        # Tạo biểu đồ
+        plt.figure(figsize=(12, 8))
+        bars = plt.bar(metrics, values, color=colors, alpha=0.8, edgecolor='black', linewidth=2)
+        
+        # Thêm giá trị trên mỗi cột
+        for bar, value in zip(bars, values):
+            height = bar.get_height()
+            plt.text(bar.get_x() + bar.get_width()/2., height + (max(values) * 0.05),
+                    f'{value}', ha='center', va='bottom', fontsize=14, fontweight='bold')
+        
+        plt.title('Hiệu Năng Hệ Thống AI Image Similarity (Dữ Liệu Thực Tế)', fontsize=18, fontweight='bold', pad=20)
+        plt.ylabel('Giá trị', fontsize=14)
+        plt.ylim(0, max(values) * 1.3 if max(values) > 0 else 10)
+        
+        # Thêm grid
+        plt.grid(True, alpha=0.3, axis='y')
+        
+        # Thêm thông tin chi tiết từ dữ liệu thực tế
+        detail_text = []
+        if stats["extraction_performance"]["total_images"] > 0:
+            detail_text.append(f'• Hiệu năng: {stats["extraction_performance"]["avg_time_per_image"]:.2f}s/ảnh (từ {stats["extraction_performance"]["total_images"]} ảnh)')
+        else:
+            detail_text.append('• Hiệu năng: Chưa có dữ liệu')
+            
+        if stats["search_performance"]["total_searches"] > 0:
+            detail_text.append(f'• Tốc độ tìm kiếm: {stats["search_performance"]["avg_time_per_search"]:.2f}ms (từ {stats["search_performance"]["total_searches"]} lần tìm)')
+        else:
+            detail_text.append('• Tốc độ tìm kiếm: Chưa có dữ liệu')
+            
+        if stats["accuracy"]["total_measurements"] > 0:
+            detail_text.append(f'• Độ chính xác: {stats["accuracy"]["avg_accuracy"]*100:.1f}% (từ {stats["accuracy"]["total_measurements"]} đo)')
+        else:
+            detail_text.append('• Độ chính xác: Chưa có dữ liệu')
+        
+        detail_text.append(f'• Cập nhật lần cuối: {stats["last_updated"].strftime("%Y-%m-%d %H:%M:%S") if stats["last_updated"] else "Chưa có"}')
+        
+        plt.figtext(0.5, 0.02, '\n'.join(detail_text),
+                   ha='center', fontsize=12, bbox=dict(boxstyle="round,pad=0.5", facecolor="lightgray", alpha=0.8))
+        
+        # Lưu biểu đồ
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f'chart/performance_chart_real_{timestamp}.png'
+        plt.tight_layout()
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        logger.info(f"Đã tạo biểu đồ hiệu năng từ dữ liệu thực tế: {filename}")
+        return filename
+        
+    except Exception as e:
+        logger.error(f"Lỗi khi tạo biểu đồ hiệu năng: {str(e)}")
+        return None
+
+def create_data_augmentation_flowchart():
+    """Tạo sơ đồ quy trình tăng cường dữ liệu"""
+    try:
+        # Tạo thư mục chart nếu chưa có
+        os.makedirs('chart', exist_ok=True)
+        
+        # Tạo figure
+        fig, ax = plt.subplots(figsize=(16, 10))
+        
+        # Định nghĩa các bước trong quy trình
+        steps = [
+            'Ảnh gốc',
+            'Xoay ảnh\n(±20°)',
+            'Dịch chuyển\n(±20%)',
+            'Lật ngang',
+            'Thay đổi độ sáng\n(±20%)',
+            'Ảnh tăng cường'
+        ]
+        
+        # Vị trí các bước
+        x_positions = [0, 2, 4, 6, 8, 10]
+        y_position = 0
+        
+        # Vẽ các bước
+        for i, (step, x) in enumerate(zip(steps, x_positions)):
+            # Màu sắc khác nhau cho từng bước
+            colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD']
+            
+            # Vẽ box
+            box = plt.Rectangle((x-0.8, y_position-0.4), 1.6, 0.8, 
+                              facecolor=colors[i], edgecolor='black', linewidth=2, alpha=0.8)
+            ax.add_patch(box)
+            
+            # Thêm text
+            ax.text(x, y_position, step, ha='center', va='center', fontsize=12, fontweight='bold')
+            
+            # Vẽ mũi tên
+            if i < len(steps) - 1:
+                arrow = plt.arrow(x+0.8, y_position, 0.4, 0, head_width=0.1, head_length=0.1, 
+                                fc='black', ec='black', linewidth=2)
+        
+        # Thêm tiêu đề
+        ax.set_title('Sơ Đồ Quy Trình Tăng Cường Dữ Liệu (Data Augmentation)', 
+                    fontsize=18, fontweight='bold', pad=20)
+        
+        # Thêm thông tin chi tiết
+        ax.text(5, -1.5, 
+               'Quy trình tăng cường dữ liệu giúp tạo ra nhiều biến thể của ảnh gốc,\n'
+               'cải thiện độ chính xác và khả năng tổng quát hóa của mô hình ResNet50.',
+               ha='center', fontsize=14, bbox=dict(boxstyle="round,pad=0.5", facecolor="lightblue", alpha=0.8))
+        
+        # Cấu hình trục
+        ax.set_xlim(-1, 11)
+        ax.set_ylim(-2, 1)
+        ax.set_aspect('equal')
+        ax.axis('off')
+        
+        # Lưu biểu đồ
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f'chart/data_augmentation_flowchart_{timestamp}.png'
+        plt.tight_layout()
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        logger.info(f"Đã tạo sơ đồ tăng cường dữ liệu: {filename}")
+        return filename
+        
+    except Exception as e:
+        logger.error(f"Lỗi khi tạo sơ đồ tăng cường dữ liệu: {str(e)}")
+        return None
+
+def create_vector_dimensions_comparison():
+    """Tạo biểu đồ so sánh các chiều vector"""
+    try:
+        # Tạo thư mục chart nếu chưa có
+        os.makedirs('chart', exist_ok=True)
+        
+        # Dữ liệu từ README
+        dimensions = [512, 1024, 1536, 2048, 4096]
+        memory_savings = [75, 50, 25, 0, -100]  # %
+        accuracy = [87, 92, 97, 100, 100]  # %
+        speed = [95, 85, 70, 60, 40]  # % (relative speed)
+        
+        # Tạo subplot
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 6))
+        
+        # Biểu đồ 1: Tiết kiệm bộ nhớ
+        bars1 = ax1.bar([str(d) for d in dimensions], memory_savings, 
+                       color=['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7'])
+        ax1.set_title('Tiết Kiệm Bộ Nhớ (%)', fontsize=14, fontweight='bold')
+        ax1.set_ylabel('Tiết kiệm (%)')
+        ax1.grid(True, alpha=0.3)
+        for bar, value in zip(bars1, memory_savings):
+            height = bar.get_height()
+            ax1.text(bar.get_x() + bar.get_width()/2., height + (1 if height >= 0 else -3),
+                    f'{value}%', ha='center', va='bottom' if height >= 0 else 'top', fontweight='bold')
+        
+        # Biểu đồ 2: Độ chính xác
+        bars2 = ax2.bar([str(d) for d in dimensions], accuracy, 
+                       color=['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7'])
+        ax2.set_title('Độ Chính Xác (%)', fontsize=14, fontweight='bold')
+        ax2.set_ylabel('Độ chính xác (%)')
+        ax2.set_ylim(80, 105)
+        ax2.grid(True, alpha=0.3)
+        for bar, value in zip(bars2, accuracy):
+            height = bar.get_height()
+            ax2.text(bar.get_x() + bar.get_width()/2., height + 1,
+                    f'{value}%', ha='center', va='bottom', fontweight='bold')
+        
+        # Biểu đồ 3: Tốc độ
+        bars3 = ax3.bar([str(d) for d in dimensions], speed, 
+                       color=['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7'])
+        ax3.set_title('Tốc Độ Tương Đối (%)', fontsize=14, fontweight='bold')
+        ax3.set_ylabel('Tốc độ (%)')
+        ax3.grid(True, alpha=0.3)
+        for bar, value in zip(bars3, speed):
+            height = bar.get_height()
+            ax3.text(bar.get_x() + bar.get_width()/2., height + 1,
+                    f'{value}%', ha='center', va='bottom', fontweight='bold')
+        
+        # Tiêu đề chung
+        fig.suptitle('So Sánh Hiệu Suất Các Chiều Vector ResNet50', fontsize=18, fontweight='bold')
+        
+        # Lưu biểu đồ
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f'chart/vector_dimensions_comparison_{timestamp}.png'
+        plt.tight_layout()
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        logger.info(f"Đã tạo biểu đồ so sánh chiều vector: {filename}")
+        return filename
+        
+    except Exception as e:
+        logger.error(f"Lỗi khi tạo biểu đồ so sánh chiều vector: {str(e)}")
+        return None
+
+def auto_generate_charts():
+    """Tự động tạo tất cả biểu đồ"""
+    try:
+        charts_created = []
+        
+        # Tạo biểu đồ hiệu năng
+        perf_chart = create_performance_chart()
+        if perf_chart:
+            charts_created.append(perf_chart)
+        
+        # Tạo sơ đồ tăng cường dữ liệu
+        aug_chart = create_data_augmentation_flowchart()
+        if aug_chart:
+            charts_created.append(aug_chart)
+        
+        # Tạo biểu đồ so sánh chiều vector
+        dim_chart = create_vector_dimensions_comparison()
+        if dim_chart:
+            charts_created.append(dim_chart)
+        
+        logger.info(f"Đã tạo {len(charts_created)} biểu đồ: {charts_created}")
+        return charts_created
+        
+    except Exception as e:
+        logger.error(f"Lỗi khi tạo biểu đồ tự động: {str(e)}")
+        return []
+
+def get_model_for_dimensions(dimensions):
+    """Get or create model for specified dimensions using only ResNet50"""
+    global _models
+    
+    with _model_lock:
+        if dimensions not in _models:
+            logger.info(f"Creating new model for {dimensions} dimensions")
+            # Always use ResNet50 as base model
+            base_model = ResNet50(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+            base_model.trainable = False
+            
+            if dimensions == 2048:
+                # Default ResNet50 with GlobalMaxPooling2D (2048 dimensions)
+                model = tf.keras.Sequential([base_model, GlobalMaxPooling2D()])
+                logger.info("Created ResNet50 with GlobalMaxPooling2D for 2048 dimensions")
+            elif dimensions == 4096:
+                # ResNet50 with additional Dense layer to expand to 4096
+                model = tf.keras.Sequential([
+                    base_model, 
+                    GlobalMaxPooling2D(),
+                    tf.keras.layers.Dense(4096, activation='relu')
+                ])
+                logger.info("Created ResNet50 with Dense(4096) for 4096 dimensions")
+            elif dimensions in [512, 1024, 1536]:
+                # ResNet50 with Dense layer to reduce dimensions
+                model = tf.keras.Sequential([
+                    base_model, 
+                    GlobalMaxPooling2D(),
+                    tf.keras.layers.Dense(dimensions, activation='relu')
+                ])
+                logger.info(f"Created ResNet50 with Dense({dimensions}) for {dimensions} dimensions")
+            else:
+                # Default to ResNet50 with GlobalMaxPooling2D
+                model = tf.keras.Sequential([base_model, GlobalMaxPooling2D()])
+                logger.info(f"Created default ResNet50 with GlobalMaxPooling2D for {dimensions} dimensions")
+            
+            # Test the model output shape
+            test_input = tf.random.normal((1, 224, 224, 3))
+            test_output = model(test_input)
+            logger.info(f"Model test output shape: {test_output.shape}")
+            
+            _models[dimensions] = model
+            logger.info(f"Created ResNet50 model for {dimensions} dimensions")
+        else:
+            logger.info(f"Using cached model for {dimensions} dimensions")
+        
+        return _models[dimensions]
+
+# Initialize default model
+base_model = ResNet50(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+base_model.trainable = False
+model = tf.keras.Sequential([base_model, GlobalMaxPooling2D()])
+_models[2048] = model  # Store default model
 
 # Thêm biến toàn cục để lưu cache
 _features_cache = {
@@ -79,15 +514,6 @@ def build_model(input_dim):
 # Azure Blob Storage URL
 AZURE_URL = "https://dbimage.blob.core.windows.net/images"
 API_URL = os.getenv("API_URL", "http://localhost:8080/api/v1/public")
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Constants for image processing
-MIN_IMAGE_SIZE = 224  # Minimum size for feature extraction
-MAX_IMAGE_SIZE = 1024  # Maximum size to prevent memory issues
-QUALITY_THRESHOLD = 0.5  # Lowered quality threshold for images
 
 def preprocess_image(image_data):
     """Enhanced image preprocessing for better feature extraction"""
@@ -161,17 +587,40 @@ def extract_features(img_array_bytes):
         img_tensor = tf.convert_to_tensor(img, dtype=tf.float32)
         img_tensor = preprocess_input(img_tensor)
         
+        # Get the appropriate model for current dimensions
+        current_model = get_model_for_dimensions(VECTOR_DIMENSIONS_CONFIG)
+        logger.info(f"Using model for {VECTOR_DIMENSIONS_CONFIG} dimensions")
+        
         # Extract features using the model
-        features = model(img_tensor)
+        features = current_model(img_tensor)
+        logger.info(f"Raw features shape: {features.shape}")
         
         # Convert to numpy and normalize
         features = features.numpy()
         features = features / np.linalg.norm(features)
+        logger.info(f"Normalized features shape: {features.shape}")
         
-        return features.flatten()  # Return 1D array
+        # Check if dimensions match expected - FIXED LOGIC
+        expected_dimensions = VECTOR_DIMENSIONS_CONFIG
+        actual_dimensions = features.shape[-1] if len(features.shape) > 1 else features.size
+        
+        logger.info(f"Expected dimensions: {expected_dimensions}, Actual dimensions: {actual_dimensions}")
+        
+        if actual_dimensions != expected_dimensions:
+            logger.error(f"Model output dimensions {actual_dimensions} don't match expected {expected_dimensions}")
+            return None
+        
+        flattened_features = features.flatten()  # Return 1D array
+        logger.info(f"Final flattened features shape: {flattened_features.shape}")
+        return flattened_features
     except Exception as e:
         logger.error(f"Error extracting features: {str(e)}")
         return None
+
+def get_vector_dimensions():
+    """Get the expected vector dimensions for the current model"""
+    # ResNet50 with GlobalMaxPooling2D produces 2048-dimensional features
+    return VECTOR_DIMENSIONS_CONFIG
 
 def send_vector_features(image_id, features):
     """
@@ -186,17 +635,21 @@ def send_vector_features(image_id, features):
         # Convert features to string format
         features_str = ','.join(map(str, features))
         
+        # Get vector dimensions
+        vector_dimensions = len(features)
+        
         # Send update request to API
         update_response = requests.put(
             f"{API_URL}/image/update/vector_feature",
             json={
                 "id": image_id,
-                "vectorFeatures": features_str
+                "vectorFeatures": features_str,
+                "vectorDimensions": vector_dimensions
             }
         )
         
         if update_response.status_code == 200:
-            logger.info(f"Successfully updated vector features for image {image_id}")
+            logger.info(f"Successfully updated vector features for image {image_id} with {vector_dimensions} dimensions")
             return True
         else:
             logger.error(f"Failed to update vector features: {update_response.status_code}")
@@ -286,6 +739,8 @@ def augment_and_save_image(img_path, image_id, n_aug=5):
 def process_single_image(image_url, image_id):
     """Process a single image with enhanced error handling and validation"""
     try:
+        start_time = time.time()  # Bắt đầu đo thời gian
+        
         # Download image
         response = requests.get(image_url, timeout=10)
         if response.status_code != 200:
@@ -328,7 +783,11 @@ def process_single_image(image_url, image_id):
             aug_results = augment_and_save_image(temp_path, image_id)
             logger.info(f"Generated {len(aug_results)} augmented images for {image_id}")
 
-            logger.info(f"Successfully processed image {image_url} for image {image_id}")
+            # Tính thời gian xử lý và ghi lại
+            extraction_time = time.time() - start_time
+            record_extraction_time(extraction_time)
+            logger.info(f"Successfully processed image {image_url} for image {image_id} in {extraction_time:.2f} seconds")
+            
             return True, None
             
         finally:
@@ -357,9 +816,10 @@ def validate_features(features):
         if len(features.shape) > 1:
             features = features.flatten()
             
-        # Check if vector has expected dimensions (1536 for EfficientNetB3 with GlobalMaxPooling2D)
-        if features.size != 1536:
-            logger.error(f"Invalid feature dimensions: {features.size} != 1536")
+        # Check if vector has expected dimensions from config
+        expected_dimensions = get_vector_dimensions()
+        if features.size != expected_dimensions:
+            logger.error(f"Invalid feature dimensions: {features.size} != {expected_dimensions}")
             return False
             
         # Check for NaN or infinite values
@@ -386,23 +846,35 @@ def reduce_dimensions(features, target_dim=512):
     """
     Reduce feature dimensions using PCA if needed
     Args:
-        features: numpy array of features (n_samples, n_features)
+        features: numpy array of features (n_samples, n_features) or (n_features,)
         target_dim: target dimension (default: 512)
     Returns:
         Reduced features
     """
     try:
-        if features.shape[1] == target_dim:
+        # Ensure features is 2D
+        if len(features.shape) == 1:
+            features = features.reshape(1, -1)
+        
+        original_dim = features.shape[1]
+        
+        if original_dim == target_dim:
             return features
             
+        logger.info(f"Applying PCA to reduce dimensions from {original_dim} to {target_dim}")
+        
         pca = PCA(n_components=target_dim)
         reduced_features = pca.fit_transform(features)
+        
+        # Calculate explained variance ratio
+        explained_variance_ratio = np.sum(pca.explained_variance_ratio_)
+        logger.info(f"PCA explained variance ratio: {explained_variance_ratio:.4f} ({explained_variance_ratio*100:.2f}%)")
         
         # Normalize the reduced features
         norms = np.linalg.norm(reduced_features, axis=1)
         reduced_features = reduced_features / norms[:, np.newaxis]
         
-        logger.info(f"Reduced features from {features.shape[1]} to {target_dim} dimensions")
+        logger.info(f"Successfully reduced features from {original_dim} to {target_dim} dimensions")
         return reduced_features
     except Exception as e:
         logger.error(f"Error reducing dimensions: {str(e)}")
@@ -533,6 +1005,8 @@ def invalidate_features_cache():
 def find_similar_images():
     """Find similar images based on a query image URL or uploaded file"""
     try:
+        search_start_time = time.time()  # Bắt đầu đo thời gian tìm kiếm
+        
         # Lấy features từ cache
         features, filenames, valid_indices = get_cached_features()
         if features is None or filenames is None:
@@ -592,7 +1066,22 @@ def find_similar_images():
             for idx in top_indices if similarities[idx] > 0
         ]
 
-        return jsonify({"similar_images": similar_images}), 200
+        # Tính thời gian tìm kiếm và ghi lại
+        search_time_ms = (time.time() - search_start_time) * 1000  # Chuyển sang milliseconds
+        record_search_time(search_time_ms)
+        
+        # Tính độ chính xác dựa trên similarity scores
+        if similar_images:
+            avg_similarity = sum(img["similarity"] for img in similar_images) / len(similar_images)
+            record_accuracy_score(avg_similarity)
+        
+        logger.info(f"Search completed in {search_time_ms:.2f}ms with {len(similar_images)} results")
+
+        return jsonify({
+            "similar_images": similar_images,
+            "search_time_ms": round(search_time_ms, 2),
+            "total_images_searched": len(features)
+        }), 200
 
     except Exception as e:
         logger.error(f"Error in find_similar_images route: {str(e)}")
@@ -630,7 +1119,12 @@ def start_extraction():
     thread.daemon = True
     thread.start()
     
-    return jsonify({"message": "Đã bắt đầu quá trình trích xuất đặc trưng"})
+    response_data = {"message": "Đã bắt đầu quá trình trích xuất đặc trưng"}
+    
+    # Tự động tạo biểu đồ
+    response_data = add_chart_generation_to_response(response_data, 'extraction_start')
+    
+    return jsonify(response_data)
 
 @app.route("/api/extraction/stop", methods=["POST"])
 def stop_extraction():
@@ -671,13 +1165,18 @@ def get_extraction_stats():
                 if img.get("vectorFeatures") and img.get("vectorFeatures").strip():
                     product_stats[product_id]["with_features"] += 1
 
-        return jsonify({
+        response_data = {
             "total_images": total_images,
             "images_with_features": images_with_features,
             "images_without_features": total_images - images_with_features,
             "completion_percentage": (images_with_features / total_images * 100) if total_images > 0 else 0,
             "product_stats": product_stats
-        })
+        }
+        
+        # Tự động tạo biểu đồ
+        response_data = add_chart_generation_to_response(response_data, 'extraction_stats')
+
+        return jsonify(response_data), 200
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -839,6 +1338,8 @@ def extract_features_from_url(image_path_or_url):
         Normalized feature vector or None if extraction fails
     """
     try:
+        extraction_start_time = time.time()  # Bắt đầu đo thời gian
+        
         # Check if it's a URL or local file path
         if image_path_or_url.startswith(('http://', 'https://')):
             # Download image from URL
@@ -876,6 +1377,11 @@ def extract_features_from_url(image_path_or_url):
         if not validate_features(features):
             logger.error("Invalid features extracted")
             return None
+
+        # Ghi lại thời gian trích xuất cho ảnh đơn lẻ
+        extraction_time = time.time() - extraction_start_time
+        record_extraction_time(extraction_time)
+        logger.info(f"Feature extraction completed in {extraction_time:.2f} seconds for {image_path_or_url}")
 
         return features
 
@@ -1196,6 +1702,7 @@ def update_single_vector_feature():
                 return jsonify({"error": "Không tìm thấy ảnh trong hệ thống"}), 404
 
             vector_features = image_data.get('vectorFeatures')
+            expected_dimensions = get_vector_dimensions()
             
             # Log chi tiết về vector features
             logger.info(f"Vector features của ảnh {image_id}:")
@@ -1203,12 +1710,12 @@ def update_single_vector_feature():
             logger.info(f"- Độ dài vector: {len(vector_features) if vector_features else 0}")
             logger.info(f"- Vector features: {vector_features[:100] + '...' if vector_features and len(vector_features) > 100 else vector_features}")
 
-            # Kiểm tra kỹ hơn về vector features
+            # Kiểm tra kỹ hơn về vector features và chiều vector
             has_valid_features = (
                 vector_features and 
                 isinstance(vector_features, str) and 
                 vector_features.strip() and 
-                len(vector_features.split(',')) >= 100  # Đảm bảo vector có đủ số chiều
+                len(vector_features.split(',')) == expected_dimensions  # Đảm bảo vector có đúng số chiều
             )
 
             # Nếu có vector features hợp lệ và không yêu cầu force update thì bỏ qua
@@ -1219,7 +1726,9 @@ def update_single_vector_feature():
                     "id": image_id,
                     "path": image_path,
                     "status": "skipped",
-                    "vector_length": len(vector_features.split(','))
+                    "vector_length": len(vector_features.split(',')),
+                    "expected_dimensions": expected_dimensions,
+                    "is_consistent": True
                 }), 200
             else:
                 if has_valid_features:
@@ -1239,6 +1748,16 @@ def update_single_vector_feature():
             logger.error(f"Không thể trích xuất đặc trưng cho ảnh {image_id}")
             return jsonify({"error": "Không thể trích xuất đặc trưng"}), 400
 
+        # Kiểm tra chiều vector sau khi trích xuất - CHỈ KIỂM TRA KHI KHÔNG PHẢI FORCE UPDATE
+        actual_dimensions = len(features)
+        if not force_update and actual_dimensions != expected_dimensions:
+            logger.error(f"Chiều vector không đúng: {actual_dimensions} != {expected_dimensions}")
+            return jsonify({
+                "error": f"Chiều vector không đúng: {actual_dimensions} != {expected_dimensions}",
+                "actual_dimensions": actual_dimensions,
+                "expected_dimensions": expected_dimensions
+            }), 400
+
         # Chuyển đổi features thành string
         features_str = ','.join(map(str, features))
         logger.info(f"Đã trích xuất và chuẩn hóa đặc trưng thành công, độ dài vector: {len(features)}")
@@ -1250,7 +1769,8 @@ def update_single_vector_feature():
                 f"{API_URL}/image/update/vector_feature",
                 json={
                     "id": image_id,
-                    "vectorFeatures": features_str
+                    "vectorFeatures": features_str,
+                    "vectorDimensions": actual_dimensions
                 }
             )
             
@@ -1263,7 +1783,9 @@ def update_single_vector_feature():
                     "id": image_id,
                     "path": image_path,
                     "status": "success",
-                    "vector_length": len(features)
+                    "vector_length": len(features),
+                    "expected_dimensions": expected_dimensions,
+                    "is_consistent": True
                 }), 200
             else:
                 logger.error(f"Lỗi khi cập nhật vector features: {update_response.status_code}")
@@ -1417,6 +1939,626 @@ def clear_features_cache():
         return jsonify({"message": "Cache đã được xóa thành công"}), 200
     except Exception as e:
         logger.error(f"Lỗi khi xóa cache: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/extraction/vector_dimensions", methods=["GET"])
+def get_vector_dimensions_info():
+    """Get information about vector dimensions across all images"""
+    try:
+        # Get all images from API
+        response = requests.get(f"{API_URL}/images")
+        if response.status_code != 200:
+            return jsonify({"error": "Failed to fetch images from API"}), 500
+
+        data = response.json()
+        if isinstance(data, dict) and 'data' in data:
+            images = data['data']
+        else:
+            images = data if isinstance(data, list) else []
+
+        if not images:
+            return jsonify({"error": "No images found in database"}), 400
+
+        # Analyze vector dimensions
+        dimension_stats = {}
+        images_with_features = []
+        images_without_features = []
+        inconsistent_dimensions = []
+
+        expected_dimensions = get_vector_dimensions()
+
+        for img in images:
+            vector_features = img.get('vectorFeatures')
+            vector_dimensions = img.get('vectorDimensions')
+            
+            if vector_features and vector_features.strip():
+                # Count dimensions
+                actual_dimensions = len(vector_features.split(','))
+                
+                if actual_dimensions not in dimension_stats:
+                    dimension_stats[actual_dimensions] = 0
+                dimension_stats[actual_dimensions] += 1
+                
+                images_with_features.append({
+                    'id': img.get('id'),
+                    'path': img.get('path'),
+                    'productId': img.get('productId'),
+                    'actual_dimensions': actual_dimensions,
+                    'expected_dimensions': expected_dimensions,
+                    'is_consistent': actual_dimensions == expected_dimensions
+                })
+                
+                # Check for inconsistency
+                if actual_dimensions != expected_dimensions:
+                    inconsistent_dimensions.append({
+                        'id': img.get('id'),
+                        'path': img.get('path'),
+                        'productId': img.get('productId'),
+                        'actual_dimensions': actual_dimensions,
+                        'expected_dimensions': expected_dimensions
+                    })
+            else:
+                images_without_features.append({
+                    'id': img.get('id'),
+                    'path': img.get('path'),
+                    'productId': img.get('productId')
+                })
+
+        # Group by product
+        product_dimensions = {}
+        for img in images_with_features:
+            product_id = img['productId']
+            if product_id not in product_dimensions:
+                product_dimensions[product_id] = {
+                    'productId': product_id,
+                    'total_images': 0,
+                    'images_with_features': 0,
+                    'dimensions': set(),
+                    'is_consistent': True
+                }
+            
+            product_dimensions[product_id]['total_images'] += 1
+            product_dimensions[product_id]['images_with_features'] += 1
+            product_dimensions[product_id]['dimensions'].add(img['actual_dimensions'])
+            
+            if not img['is_consistent']:
+                product_dimensions[product_id]['is_consistent'] = False
+
+        # Convert sets to lists for JSON serialization
+        for product in product_dimensions.values():
+            product['dimensions'] = list(product['dimensions'])
+
+        return jsonify({
+            "expected_dimensions": expected_dimensions,
+            "dimension_stats": dimension_stats,
+            "total_images": len(images),
+            "images_with_features": len(images_with_features),
+            "images_without_features": len(images_without_features),
+            "inconsistent_dimensions": inconsistent_dimensions,
+            "product_dimensions": list(product_dimensions.values()),
+            "is_system_consistent": len(inconsistent_dimensions) == 0 and len(images_with_features) > 0
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error getting vector dimensions info: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/extraction/config", methods=["GET", "POST"])
+def configure_extraction():
+    """Configure extraction settings and get current configuration"""
+    global VECTOR_DIMENSIONS_CONFIG
+    
+    if request.method == "GET":
+        # Get current configuration
+        current_dimensions = VECTOR_DIMENSIONS_CONFIG
+        
+        # Always use ResNet50 for all dimensions
+        model_type = "ResNet50"
+        
+        response_data = {
+            "vector_dimensions": current_dimensions,
+            "model_type": model_type,
+            "available_dimensions": [512, 1024, 1536, 2048, 4096],
+            "description": "Sử dụng ResNet50 với Dense layer để giảm hoặc mở rộng chiều vector"
+        }
+        
+        # Tự động tạo biểu đồ
+        response_data = add_chart_generation_to_response(response_data, 'config')
+        
+        return jsonify(response_data), 200
+    
+    elif request.method == "POST":
+        try:
+            data = request.get_json()
+            if not data:
+                return jsonify({"error": "No configuration data provided"}), 400
+            
+            new_dimensions = data.get("vector_dimensions")
+            if not new_dimensions:
+                return jsonify({"error": "vector_dimensions is required"}), 400
+            
+            # Validate dimensions
+            available_dimensions = [512, 1024, 1536, 2048, 4096]
+            if new_dimensions not in available_dimensions:
+                return jsonify({
+                    "error": f"Invalid vector dimensions. Must be one of: {available_dimensions}"
+                }), 400
+            
+            # Check if dimensions changed
+            dimensions_changed = VECTOR_DIMENSIONS_CONFIG != new_dimensions
+            
+            # Update configuration
+            old_dimensions = VECTOR_DIMENSIONS_CONFIG
+            VECTOR_DIMENSIONS_CONFIG = new_dimensions
+            
+            logger.info(f"Vector dimensions changed from {old_dimensions} to {new_dimensions}")
+            
+            # Clear cache when dimensions change
+            if dimensions_changed:
+                invalidate_features_cache()
+                # Clear model cache to force recreation of model for new dimensions
+                global _models
+                with _model_lock:
+                    _models.clear()
+                logger.info("Cache and model cache cleared due to dimension change")
+            
+            # Check if there are any existing features
+            response = requests.get(f"{API_URL}/images")
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, dict) and 'data' in data:
+                    images = data['data']
+                else:
+                    images = data if isinstance(data, list) else []
+                
+                existing_features_count = sum(1 for img in images if img.get('vectorFeatures') and img.get('vectorFeatures').strip())
+                
+                response_data = {
+                    "message": "Configuration updated successfully",
+                    "old_dimensions": old_dimensions,
+                    "new_dimensions": new_dimensions,
+                    "dimensions_changed": dimensions_changed,
+                    "existing_features_count": existing_features_count,
+                    "needs_re_extraction": dimensions_changed and existing_features_count > 0,
+                    "available_dimensions": available_dimensions
+                }
+                
+                # Tự động tạo biểu đồ
+                response_data = add_chart_generation_to_response(response_data, 'config')
+                
+                return jsonify(response_data), 200
+            else:
+                response_data = {
+                    "message": "Configuration updated successfully",
+                    "old_dimensions": old_dimensions,
+                    "new_dimensions": new_dimensions,
+                    "dimensions_changed": dimensions_changed,
+                    "warning": "Could not check existing features"
+                }
+                
+                # Tự động tạo biểu đồ
+                response_data = add_chart_generation_to_response(response_data, 'config')
+                
+                return jsonify(response_data), 200
+                
+        except Exception as e:
+            logger.error(f"Error configuring extraction: {str(e)}")
+            return jsonify({"error": str(e)}), 500
+
+@app.route("/api/extraction/fix_dimensions", methods=["POST"])
+def fix_inconsistent_dimensions():
+    """Fix images with inconsistent vector dimensions"""
+    try:
+        logger.info("=== BẮT ĐẦU SỬA CHỮA CHIỀU VECTOR KHÔNG NHẤT QUÁN ===")
+        
+        # Get vector dimensions info
+        response = requests.get(f"{API_URL}/images")
+        if response.status_code != 200:
+            return jsonify({"error": "Failed to fetch images from API"}), 500
+
+        data = response.json()
+        if isinstance(data, dict) and 'data' in data:
+            images = data['data']
+        else:
+            images = data if isinstance(data, list) else []
+
+        if not images:
+            return jsonify({"error": "No images found in database"}), 400
+
+        expected_dimensions = get_vector_dimensions()
+        inconsistent_images = []
+        
+        # Find images with inconsistent dimensions
+        for img in images:
+            vector_features = img.get('vectorFeatures')
+            if vector_features and vector_features.strip():
+                actual_dimensions = len(vector_features.split(','))
+                if actual_dimensions != expected_dimensions:
+                    inconsistent_images.append(img)
+
+        if not inconsistent_images:
+            return jsonify({
+                "message": "Không có ảnh nào có chiều vector không nhất quán",
+                "fixed_count": 0,
+                "total_checked": len(images)
+            }), 200
+
+        logger.info(f"Tìm thấy {len(inconsistent_images)} ảnh có chiều vector không nhất quán")
+
+        # Fix each inconsistent image
+        success_count = 0
+        failed_count = 0
+        failed_images = []
+
+        for img in inconsistent_images:
+            try:
+                image_id = img.get('id')
+                image_path = img.get('path')
+                
+                if not image_id or not image_path:
+                    logger.warning(f"Ảnh thiếu thông tin: ID={image_id}, Path={image_path}")
+                    failed_count += 1
+                    failed_images.append({
+                        "id": image_id,
+                        "error": "Thiếu thông tin ảnh"
+                    })
+                    continue
+
+                logger.info(f"Đang sửa chữa ảnh: {image_path} (ID: {image_id})")
+
+                # Extract features
+                features = extract_features_from_url(image_path)
+                if features is None:
+                    logger.error(f"Không thể trích xuất đặc trưng cho ảnh {image_id}")
+                    failed_count += 1
+                    failed_images.append({
+                        "id": image_id,
+                        "error": "Không thể trích xuất đặc trưng"
+                    })
+                    continue
+
+                # Check dimensions again
+                actual_dimensions = len(features)
+                if actual_dimensions != expected_dimensions:
+                    logger.error(f"Chiều vector vẫn không đúng sau khi trích xuất: {actual_dimensions} != {expected_dimensions}")
+                    failed_count += 1
+                    failed_images.append({
+                        "id": image_id,
+                        "error": f"Chiều vector không đúng: {actual_dimensions} != {expected_dimensions}"
+                    })
+                    continue
+
+                # Convert features to string
+                features_str = ','.join(map(str, features))
+
+                # Update vector features
+                update_response = requests.put(
+                    f"{API_URL}/image/update/vector_feature",
+                    json={
+                        "id": image_id,
+                        "vectorFeatures": features_str,
+                        "vectorDimensions": actual_dimensions
+                    }
+                )
+
+                if update_response.status_code == 200:
+                    logger.info(f"Đã sửa chữa thành công vector features cho ảnh {image_id}")
+                    success_count += 1
+                else:
+                    logger.error(f"Không thể cập nhật vector features: {update_response.status_code}")
+                    failed_count += 1
+                    failed_images.append({
+                        "id": image_id,
+                        "error": f"Lỗi cập nhật: {update_response.status_code}"
+                    })
+
+            except Exception as e:
+                logger.error(f"Lỗi khi sửa chữa ảnh {image_id}: {str(e)}")
+                failed_count += 1
+                failed_images.append({
+                    "id": image_id,
+                    "error": str(e)
+                })
+
+        # Invalidate cache
+        invalidate_features_cache()
+        logger.info("Đã sửa chữa xong và xóa cache")
+
+        logger.info("=== KẾT THÚC SỬA CHỮA CHIỀU VECTOR KHÔNG NHẤT QUÁN ===")
+        logger.info(f"Kết quả: {success_count} thành công, {failed_count} thất bại")
+
+        return jsonify({
+            "message": "Đã sửa chữa xong chiều vector không nhất quán",
+            "total_checked": len(images),
+            "inconsistent_found": len(inconsistent_images),
+            "fixed_count": success_count,
+            "failed_count": failed_count,
+            "failed_images": failed_images
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Lỗi không mong muốn: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+# Chart generation API endpoints
+@app.route("/api/charts/generate", methods=["POST"])
+def generate_charts():
+    """Tạo tất cả biểu đồ"""
+    try:
+        data = request.get_json() or {}
+        chart_types = data.get('chart_types', ['all'])  # ['performance', 'augmentation', 'dimensions', 'all']
+        
+        charts_created = []
+        
+        if 'all' in chart_types or 'performance' in chart_types:
+            perf_chart = create_performance_chart()
+            if perf_chart:
+                charts_created.append({"type": "performance", "file": perf_chart})
+        
+        if 'all' in chart_types or 'augmentation' in chart_types:
+            aug_chart = create_data_augmentation_flowchart()
+            if aug_chart:
+                charts_created.append({"type": "augmentation", "file": aug_chart})
+        
+        if 'all' in chart_types or 'dimensions' in chart_types:
+            dim_chart = create_vector_dimensions_comparison()
+            if dim_chart:
+                charts_created.append({"type": "dimensions", "file": dim_chart})
+        
+        return jsonify({
+            "message": "Đã tạo biểu đồ thành công",
+            "charts_created": charts_created,
+            "total_charts": len(charts_created)
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Lỗi khi tạo biểu đồ: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/charts/performance", methods=["GET"])
+def get_performance_chart():
+    """Tạo và trả về biểu đồ hiệu năng"""
+    try:
+        chart_file = create_performance_chart()
+        if chart_file and os.path.exists(chart_file):
+            # Đọc file ảnh và trả về base64
+            with open(chart_file, 'rb') as f:
+                image_data = f.read()
+            base64_image = base64.b64encode(image_data).decode('utf-8')
+            
+            return jsonify({
+                "message": "Biểu đồ hiệu năng đã được tạo",
+                "chart_file": chart_file,
+                "base64_image": base64_image,
+                "image_type": "image/png"
+            }), 200
+        else:
+            return jsonify({"error": "Không thể tạo biểu đồ hiệu năng"}), 500
+            
+    except Exception as e:
+        logger.error(f"Lỗi khi tạo biểu đồ hiệu năng: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/charts/augmentation", methods=["GET"])
+def get_augmentation_chart():
+    """Tạo và trả về sơ đồ tăng cường dữ liệu"""
+    try:
+        chart_file = create_data_augmentation_flowchart()
+        if chart_file and os.path.exists(chart_file):
+            # Đọc file ảnh và trả về base64
+            with open(chart_file, 'rb') as f:
+                image_data = f.read()
+            base64_image = base64.b64encode(image_data).decode('utf-8')
+            
+            return jsonify({
+                "message": "Sơ đồ tăng cường dữ liệu đã được tạo",
+                "chart_file": chart_file,
+                "base64_image": base64_image,
+                "image_type": "image/png"
+            }), 200
+        else:
+            return jsonify({"error": "Không thể tạo sơ đồ tăng cường dữ liệu"}), 500
+            
+    except Exception as e:
+        logger.error(f"Lỗi khi tạo sơ đồ tăng cường dữ liệu: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/charts/dimensions", methods=["GET"])
+def get_dimensions_chart():
+    """Tạo và trả về biểu đồ so sánh chiều vector"""
+    try:
+        chart_file = create_vector_dimensions_comparison()
+        if chart_file and os.path.exists(chart_file):
+            # Đọc file ảnh và trả về base64
+            with open(chart_file, 'rb') as f:
+                image_data = f.read()
+            base64_image = base64.b64encode(image_data).decode('utf-8')
+            
+            return jsonify({
+                "message": "Biểu đồ so sánh chiều vector đã được tạo",
+                "chart_file": chart_file,
+                "base64_image": base64_image,
+                "image_type": "image/png"
+            }), 200
+        else:
+            return jsonify({"error": "Không thể tạo biểu đồ so sánh chiều vector"}), 500
+            
+    except Exception as e:
+        logger.error(f"Lỗi khi tạo biểu đồ so sánh chiều vector: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/charts/list", methods=["GET"])
+def list_charts():
+    """Liệt kê tất cả biểu đồ đã tạo"""
+    try:
+        chart_dir = 'chart'
+        if not os.path.exists(chart_dir):
+            return jsonify({"charts": [], "message": "Thư mục chart chưa tồn tại"}), 200
+        
+        charts = []
+        for filename in os.listdir(chart_dir):
+            if filename.endswith('.png'):
+                file_path = os.path.join(chart_dir, filename)
+                file_stats = os.stat(file_path)
+                charts.append({
+                    "filename": filename,
+                    "file_path": file_path,
+                    "size_mb": round(file_stats.st_size / (1024 * 1024), 2),
+                    "created_time": datetime.fromtimestamp(file_stats.st_ctime).strftime("%Y-%m-%d %H:%M:%S"),
+                    "modified_time": datetime.fromtimestamp(file_stats.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                })
+        
+        # Sắp xếp theo thời gian tạo mới nhất
+        charts.sort(key=lambda x: x['created_time'], reverse=True)
+        
+        return jsonify({
+            "charts": charts,
+            "total_charts": len(charts),
+            "chart_directory": os.path.abspath(chart_dir)
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Lỗi khi liệt kê biểu đồ: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+# Modify existing endpoints to auto-generate charts
+def add_chart_generation_to_response(response_data, endpoint_name):
+    """Thêm thông tin biểu đồ vào response"""
+    try:
+        # Tạo biểu đồ tự động cho một số endpoint quan trọng
+        if endpoint_name in ['extraction_stats', 'extraction_start', 'config']:
+            charts_created = auto_generate_charts()
+            if charts_created:
+                response_data['charts_generated'] = charts_created
+                response_data['chart_message'] = f"Đã tự động tạo {len(charts_created)} biểu đồ"
+        
+        return response_data
+    except Exception as e:
+        logger.error(f"Lỗi khi tạo biểu đồ tự động: {str(e)}")
+        return response_data
+
+@app.route("/api/performance/stats", methods=["GET"])
+def get_performance_stats():
+    """Lấy thống kê hiệu năng thực tế"""
+    try:
+        stats = get_performance_statistics()
+        
+        # Tự động tạo biểu đồ hiệu năng
+        chart_file = create_performance_chart()
+        
+        response_data = {
+            "performance_statistics": stats,
+            "chart_generated": chart_file is not None,
+            "chart_file": chart_file
+        }
+        
+        return jsonify(response_data), 200
+        
+    except Exception as e:
+        logger.error(f"Lỗi khi lấy thống kê hiệu năng: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/performance/reset", methods=["POST"])
+def reset_performance_data():
+    """Reset dữ liệu hiệu năng"""
+    try:
+        global performance_metrics
+        with performance_lock:
+            performance_metrics = {
+                "extraction_times": [],
+                "search_times": [],
+                "accuracy_scores": [],
+                "total_images_processed": 0,
+                "total_searches_performed": 0,
+                "last_updated": None
+            }
+        
+        logger.info("Đã reset dữ liệu hiệu năng")
+        return jsonify({"message": "Đã reset dữ liệu hiệu năng thành công"}), 200
+        
+    except Exception as e:
+        logger.error(f"Lỗi khi reset dữ liệu hiệu năng: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/performance/export", methods=["GET"])
+def export_performance_data():
+    """Xuất dữ liệu hiệu năng dưới dạng CSV"""
+    try:
+        import csv
+        from io import StringIO
+        
+        stats = get_performance_statistics()
+        
+        # Tạo CSV data
+        output = StringIO()
+        writer = csv.writer(output)
+        
+        # Header
+        writer.writerow(['Metric', 'Value', 'Unit', 'Description'])
+        
+        # Extraction performance
+        writer.writerow(['Average Extraction Time', 
+                        f"{stats['extraction_performance']['avg_time_per_image']:.3f}", 
+                        'seconds', 
+                        f"Based on {stats['extraction_performance']['total_images']} images"])
+        writer.writerow(['Min Extraction Time', 
+                        f"{stats['extraction_performance']['min_time']:.3f}", 
+                        'seconds', 
+                        'Fastest extraction'])
+        writer.writerow(['Max Extraction Time', 
+                        f"{stats['extraction_performance']['max_time']:.3f}", 
+                        'seconds', 
+                        'Slowest extraction'])
+        
+        # Search performance
+        writer.writerow(['Average Search Time', 
+                        f"{stats['search_performance']['avg_time_per_search']:.3f}", 
+                        'milliseconds', 
+                        f"Based on {stats['search_performance']['total_searches']} searches"])
+        writer.writerow(['Min Search Time', 
+                        f"{stats['search_performance']['min_time']:.3f}", 
+                        'milliseconds', 
+                        'Fastest search'])
+        writer.writerow(['Max Search Time', 
+                        f"{stats['search_performance']['max_time']:.3f}", 
+                        'milliseconds', 
+                        'Slowest search'])
+        
+        # Accuracy
+        writer.writerow(['Average Accuracy', 
+                        f"{stats['accuracy']['avg_accuracy']*100:.2f}", 
+                        'percent', 
+                        f"Based on {stats['accuracy']['total_measurements']} measurements"])
+        writer.writerow(['Min Accuracy', 
+                        f"{stats['accuracy']['min_accuracy']*100:.2f}", 
+                        'percent', 
+                        'Lowest accuracy'])
+        writer.writerow(['Max Accuracy', 
+                        f"{stats['accuracy']['max_accuracy']*100:.2f}", 
+                        'percent', 
+                        'Highest accuracy'])
+        
+        # Metadata
+        writer.writerow(['Last Updated', 
+                        stats['last_updated'].strftime("%Y-%m-%d %H:%M:%S") if stats['last_updated'] else 'N/A', 
+                        '', 
+                        'Last performance measurement'])
+        
+        csv_data = output.getvalue()
+        output.close()
+        
+        # Tạo response với CSV data
+        response = app.response_class(
+            response=csv_data,
+            status=200,
+            mimetype='text/csv'
+        )
+        response.headers["Content-Disposition"] = "attachment; filename=performance_stats.csv"
+        
+        return response
+        
+    except Exception as e:
+        logger.error(f"Lỗi khi xuất dữ liệu hiệu năng: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
